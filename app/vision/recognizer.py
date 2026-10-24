@@ -4,7 +4,7 @@ import cv2
 
 from app.config import UNKNOWN_THRESHOLD
 from app.intelligence import lbph
-from app.vision import detector, preprocess
+from app.vision import face_detector, face_preprocess
 
 
 def recognize_frame(frame):
@@ -15,14 +15,14 @@ def recognize_frame(frame):
     Return:
         box, member_id, distance
     """
-    gray = preprocess.to_gray(frame)
-    box = detector.detect_face(gray)
+    gray = face_preprocess.to_gray(frame)
+    box = face_detector.detect_face(gray)
 
     if box is None:
         return None, None, None
 
-    face = preprocess.normalize(
-        preprocess.crop_face(gray, box)
+    face = face_preprocess.normalize(
+        face_preprocess.crop_face(gray, box)
     )
 
     result = lbph.predict(face)

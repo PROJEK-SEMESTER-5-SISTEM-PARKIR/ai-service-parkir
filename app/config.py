@@ -31,7 +31,7 @@ PLATE_BLUR_KERNEL = (5, 5)              # Gaussian Blur
 PLATE_CANNY = (50, 150)                 # ambang bawah, atas Canny
 PLATE_CLOSE_KERNEL = (17, 3)            # morphological closing (lebar > tinggi: menyambung tepi karakter)
 PLATE_ASPECT_RANGE = (2.0, 5.5)         # lebar:tinggi (plat mobil ~3,2; motor ~2,4)
-PLATE_AREA_RATIO = (0.004, 0.30)        # luas kandidat relatif luas citra
+PLATE_AREA_RATIO = (0.004, 0.95)        # diizinkan sampai foto plat close-up
 PLATE_MIN_RECTANGULARITY = 0.70         # luas kontur / luas persegi panjang terkecil
 PLATE_MAX_CANDIDATES = 3                # kandidat lokasi yang dicoba ke OCR
 PLATE_CROP_MARGIN = 0.04                # tambahan sisi saat crop
@@ -40,8 +40,10 @@ PLATE_CROP_MARGIN = 0.04                # tambahan sisi saat crop
 PLATE_OCR_WIDTH = 400                   # lebar plat setelah resize
 
 # 3) OCR
-PLATE_OCR_ENGINE = "auto"               # "auto" | "easyocr" | "tesseract"
-PLATE_TESSERACT_CMD = ""                # Windows, mis. r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+PLATE_OCR_ENGINE = "tesseract"          # "auto" | "easyocr" | "tesseract"
+TESSERACT_DIR = Path(r"C:\Program Files\Tesseract-OCR")   # folder hasil instalasi Tesseract
+PLATE_TESSERACT_CMD = str(TESSERACT_DIR / "tesseract.exe")
+PLATE_TESSDATA_DIR = str(TESSERACT_DIR / "tessdata")
 PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 PLATE_MIN_CONFIDENCE = 0.40             # di bawah ini dianggap tidak yakin
 PLATE_LENGTH = (4, 9)                   # jumlah karakter (tanpa spasi) yang masuk akal: "B1AB" ... "AB1234CDE"

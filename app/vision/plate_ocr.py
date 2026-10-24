@@ -1,11 +1,17 @@
 """OCR plat: EasyOCR atau Tesseract (dipilih lewat config PLATE_OCR_ENGINE)."""
+import os
 import re
 from difflib import SequenceMatcher
 
-from app.config import PLATE_ALLOWLIST, PLATE_OCR_ENGINE, PLATE_TESSERACT_CMD
+from app.config import (PLATE_ALLOWLIST, PLATE_OCR_ENGINE, PLATE_TESSERACT_CMD,
+                        PLATE_TESSDATA_DIR)
 
 _engine = None
 _easy_reader = None
+
+# Teks dengan tinggi < 70% tinggi teks terbesar dianggap bukan nomor plat
+# (contoh: baris masa berlaku "09-23" di bawah nomor utama).
+RASIO_TINGGI_MIN = 0.7
 
 
 def _pilih_engine():
@@ -35,6 +41,15 @@ def _baca_easyocr(img):
     hasil = _easy_reader.readtext(img, allowlist=PLATE_ALLOWLIST, detail=1, paragraph=False)
     if not hasil:
         return "", 0.0
+
+    # Buang teks kecil (baris masa berlaku)
+    def tinggi(r):
+        ys = [p[1] for p in r[0]]
+        return max(ys) - min(ys)
+
+    tmax = max(tinggi(r) for r in hasil)
+    hasil = [r for r in hasil if tinggi(r) >= RASIO_TINGGI_MIN * tmax]
+
     hasil.sort(key=lambda r: min(p[0] for p in r[0]))   # kiri ke kanan
     n = sum(len(r[1]) for r in hasil) or 1
     return "".join(r[1] for r in hasil), sum(r[2] * len(r[1]) for r in hasil) / n
@@ -43,7 +58,14 @@ def _baca_easyocr(img):
 def _data_tesseract(img, cfg):
     import pytesseract
     d = pytesseract.image_to_data(img, config=cfg, output_type=pytesseract.Output.DICT)
-    return [(t.strip(), float(c)) for t, c in zip(d["text"], d["conf"]) if t.strip() and float(c) >= 0]
+    kata = [(t.strip(), float(c), int(h))
+            for t, c, h in zip(d["text"], d["conf"], d["height"])
+            if t.strip() and float(c) >= 0]
+    if not kata:
+        return []
+    hmax = max(h for _, _, h in kata)
+    # Buang teks kecil (baris masa berlaku)
+    return [(t, c) for t, c, h in kata if h >= RASIO_TINGGI_MIN * hmax]
 
 
 def _rata_conf(bagian):
@@ -58,7 +80,8 @@ def _baca_tesseract(img):
     import pytesseract
     if PLATE_TESSERACT_CMD:
         pytesseract.pytesseract.tesseract_cmd = PLATE_TESSERACT_CMD
-    dasar = "--oem 3 --psm 7"
+    os.environ["TESSDATA_PREFIX"] = PLATE_TESSDATA_DIR
+    dasar = "--oem 3 --psm 6"        # blok teks beberapa baris (plat + masa berlaku)
     dengan = _data_tesseract(img, f"{dasar} -c tessedit_char_whitelist={PLATE_ALLOWLIST}")
     tanpa = _data_tesseract(img, dasar)
 

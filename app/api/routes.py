@@ -6,23 +6,23 @@ from flask import Blueprint, jsonify, request
 from app.config import (AUGMENT, DEBUG_DIR, MIN_VALID_FRAMES, PHONE_CAMERA_URL,
                         UNKNOWN_THRESHOLD)
 from app.intelligence import dataset, lbph
-from app.vision import detector, plate_reader, preprocess
-from app.vision.detector import detect_face
-from app.vision.preprocess import decode_image, to_gray
+from app.vision import face_detector, face_preprocess, plate_reader
+from app.vision.face_detector import detect_face
+from app.vision.face_preprocess import decode_image, to_gray
 
 bp = Blueprint("api", __name__)
 
 
 def _prepare_face(file):
     """Citra mentah -> Haar cascade (cari wajah) -> crop -> normalisasi. Return (wajah, pesan_error)."""
-    img = preprocess.decode_image(file.read())
+    img = face_preprocess.decode_image(file.read())
     if img is None:
         return None, "File bukan gambar yang valid."
-    gray = preprocess.to_gray(img)
-    box = detector.detect_face(gray)
+    gray = face_preprocess.to_gray(img)
+    box = face_detector.detect_face(gray)
     if box is None:
         return None, "Wajah tidak terdeteksi. Pastikan wajah menghadap kamera dan cukup terang."
-    return preprocess.normalize(preprocess.crop_face(gray, box)), None
+    return face_preprocess.normalize(face_preprocess.crop_face(gray, box)), None
 
 
 @bp.post("/enroll")
@@ -45,7 +45,7 @@ def enroll():
         if err:
             continue
         used += 1
-        samples.extend(preprocess.augment(face) if AUGMENT else [face])
+        samples.extend(face_preprocess.augment(face) if AUGMENT else [face])
 
     required = min(MIN_VALID_FRAMES, len(files))
     if used < required:
