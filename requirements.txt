@@ -1,3 +1,12 @@
 flask
 numpy
 opencv-contrib-python==4.10.0.84
+
+# OCR plat: pilih SATU.
+# Tesseract (disarankan untuk mulai): pip install pytesseract, lalu pasang program Tesseract di Windows
+pytesseract
+# EasyOCR: lebih akurat tapi berat. Pemasangannya menarik opencv-python-headless yang MENIMPA cv2.face;
+# setelah install, jalankan:
+#   pip uninstall -y opencv-python-headless opencv-python
+#   pip install --force-reinstall --no-deps opencv-contrib-python==4.10.0.84
+# easyocr
