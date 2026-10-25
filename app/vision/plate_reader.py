@@ -5,29 +5,61 @@ Uji tanpa server (foto di data/plates, gambar tiap langkah disimpan di data/debu
 """
 import cv2
 
-from app.config import DEBUG_DIR, PLATE_TEST_DIR
+from app.config import DEBUG_DIR, PLATE_EARLY_STOP, PLATE_TEST_DIR
 from app.intelligence import plate_rules
 from app.vision import plate_detector, plate_ocr, plate_preprocess
 
 
-def read_plate(img, debug=None):
-    """Return dict: success, plate_text, plate_confidence, plate_valid, plate_candidates, box, message."""
+def _gagal(pesan):
+    return {"success": False, "plate_text": None, "plate_confidence": None, "plate_valid": False,
+            "plate_candidates": [], "box": None, "message": pesan}
+
+
+def read_plate(img, debug=None, fast=False):
+    """Return dict: success, plate_text, plate_confidence, plate_valid, plate_candidates, box, message.
+
+    fast=True: mode real-time (resize ke 640px, OCR 1 PSM x 3 varian).
+               Lebih cepat ~8-10x, cukup untuk sistem parkir live.
+    fast=False: mode akurasi tinggi (4 PSM x 8+ varian) untuk foto statis.
+    """
+    # Mode cepat: perkecil frame agar detektor tidak bekerja pada resolusi penuh
+    scale = 1.0
+    if fast:
+        h, w = img.shape[:2]
+        if w > 640:
+            scale = 640.0 / w
+            img = cv2.resize(img, (640, int(h * scale)))
+
     lokasi = plate_detector.find_plate_candidates(img, debug)
     if not lokasi:
-        return {"success": False, "plate_text": None, "plate_confidence": None, "plate_valid": False,
-                "plate_candidates": [], "box": None, "message": "Lokasi plat tidak ditemukan."}
+        return _gagal("Lokasi plat tidak ditemukan.")
 
-    hasil_ocr = []
+    semua = []
     for i, k in enumerate(lokasi):
-        varian = plate_preprocess.prepare_variants(k["crop"], debug if i == 0 else None)
-        for r in plate_ocr.read_variants(varian):
-            r["box"] = list(map(int, k["box"]))
-            hasil_ocr.append(r)
+        varian = plate_preprocess.prepare_variants(k["crop"], debug if i == 0 else None, fast=fast)
+        hasil_k = []
+        for r in plate_ocr.read_variants(varian, fast=fast):
+            # Kembalikan koordinat box ke resolusi asli
+            bx, by, bw, bh = k["box"]
+            if scale != 1.0:
+                bx = int(bx / scale); by = int(by / scale)
+                bw = int(bw / scale); bh = int(bh / scale)
+            r["box"] = [bx, by, bw, bh]
+            hasil_k.append(r)
 
-    kandidat = plate_rules.evaluasi(hasil_ocr)
+        evaluasi_k = plate_rules.evaluasi(hasil_k)
+        semua.extend(evaluasi_k)
+        if evaluasi_k and evaluasi_k[0]["valid"] and evaluasi_k[0]["confidence"] >= PLATE_EARLY_STOP:
+            break
+
+    unik = {}
+    for item in semua:
+        lama = unik.get(item["text"])
+        if lama is None or item["confidence"] > lama["confidence"]:
+            unik[item["text"]] = item
+    kandidat = sorted(unik.values(), key=plate_rules.kunci_urut)
     if not kandidat:
-        return {"success": False, "plate_text": None, "plate_confidence": None, "plate_valid": False,
-                "plate_candidates": [], "box": None, "message": "Plat ditemukan tetapi karakter tidak terbaca."}
+        return _gagal("Plat ditemukan tetapi karakter tidak terbaca.")
 
     terbaik = kandidat[0]
     return {
