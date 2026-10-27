@@ -1,6 +1,7 @@
 flask
 numpy
 opencv-contrib-python==4.10.0.84
+pymysql
 
 # OCR plat: pilih SATU.
 # Tesseract (disarankan untuk mulai): pip install pytesseract, lalu pasang program Tesseract di Windows
