@@ -8,7 +8,7 @@ MODEL_PATH = DATA_DIR / "models" / "lbph.yml"
 FACE_SIZE = (200, 200)
 MIN_FACE_PX = 80
 LBPH_PARAMS = dict(radius=1, neighbors=8, grid_x=8, grid_y=8)
-UNKNOWN_THRESHOLD = 60.0   # makin kecil makin ketat; 55 lebih aman untuk 1 member terdaftar
+UNKNOWN_THRESHOLD = 70.0   # makin kecil makin ketat; 55 lebih aman untuk 1 member terdaftar
 # Catatan kalibrasi: wajah orang SAMA biasanya distance 30-50, wajah BERBEDA > 60-80.
 # Turunkan lagi (mis. 50) jika masih salah kenali, naikkan jika wajah sendiri sering ditolak.
 
