@@ -8,7 +8,7 @@ from app.config import (AUGMENT, DEBUG_DIR, MIN_VALID_FRAMES, PHONE_CAMERA_URL,
 from app.intelligence import dataset, lbph
 from app.vision import face_detector, face_preprocess, plate_reader
 from app.vision.face_detector import detect_face
-from app.vision.face_preprocess import decode_image, to_gray
+from app.vision.face_preprocess import crop_face, decode_image, normalize, to_gray
 
 bp = Blueprint("api", __name__)
 
@@ -59,6 +59,7 @@ def enroll():
     return jsonify(member_id=int(member_id), frames=len(files), faces_used=used,
                    samples=saved, trained_images=total)
 
+
 @bp.post("/detect")
 def detect():
     f = request.files.get("photo")
@@ -69,6 +70,7 @@ def detect():
         return jsonify(face=False)
     return jsonify(face=detect_face(to_gray(img)) is not None)
 
+
 @bp.delete("/members/<int:member_id>")
 def remove_member(member_id):
     dataset.delete_member(member_id)
@@ -77,13 +79,39 @@ def remove_member(member_id):
 
 @bp.post("/recognize")
 def recognize():
+    """Kenali wajah dari foto yang dikirim.
+
+    Response JSON:
+      face_detected (bool)  - apakah ada wajah di frame
+      matched (bool)        - apakah cocok dengan member terdaftar
+      member_id (int|null)  - ID member jika matched
+      distance (float|null) - jarak LBPH (makin kecil = makin mirip)
+      warning (str|null)    - pesan peringatan jika tidak cocok / tidak terdeteksi
+    """
     file = request.files.get("photo")
     if file is None:
         return jsonify(error="Foto tidak ditemukan."), 422
 
-    face, err = _prepare_face(file)
-    if err:
-        return jsonify(error=err), 422
+    img = decode_image(file.read())
+    if img is None:
+        return jsonify(error="File bukan gambar yang valid."), 422
+
+    gray = to_gray(img)
+    box = detect_face(gray)
+
+    # ── Wajah tidak terdeteksi di frame ────────────────────────────────────
+    if box is None:
+        return jsonify(
+            face_detected=False,
+            matched=False,
+            member_id=None,
+            distance=None,
+            warning="Wajah tidak terdeteksi dalam frame. "
+                    "Pastikan wajah menghadap kamera dan cukup terang."
+        ), 200
+
+    # ── Wajah terdeteksi → cocokkan dengan model LBPH ──────────────────────
+    face = normalize(crop_face(gray, box))
 
     result = lbph.predict(face)
     if result is None:
@@ -91,8 +119,16 @@ def recognize():
 
     member_id, distance = result
     matched = distance <= UNKNOWN_THRESHOLD
-    return jsonify(matched=matched, member_id=member_id if matched else None,
-                   distance=round(distance, 2))
+
+    return jsonify(
+        face_detected=True,
+        matched=matched,
+        member_id=int(member_id) if matched else None,
+        distance=round(distance, 2),
+        warning=None if matched else (
+            "Wajah terdeteksi tetapi tidak cocok dengan member manapun (orang asing / belum terdaftar)."
+        )
+    )
 
 
 @bp.post("/retrain")
