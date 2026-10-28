@@ -84,8 +84,10 @@ class LaravelGateAPI:
     def verifikasi_akses(self, member_id: int | None, plate_text: str | None,
                          distance: float | None = None, gate: str = "gate_masuk") -> dict:
         """Kirim hasil scan wajah dan plat nomor ke Laravel untuk diputuskan."""
+        direction = "out" if "keluar" in gate.lower() else "in"
         payload = {
             "gate": gate,
+            "direction": direction,
             "member_id": member_id,
             "plate_text": plate_text,
             "distance": distance,
