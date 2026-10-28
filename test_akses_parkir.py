@@ -24,9 +24,63 @@ import urllib.error
 import urllib.request
 from collections import Counter, deque
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import numpy as np
+
+
+# ─── Server Stream MJPEG (untuk ditampilkan di web Laravel) ──────────────────
+class StreamServer:
+    """Menyiarkan frame terakhir (sudah ada kotak wajah/plat) lewat HTTP."""
+    _lock = threading.Lock()
+    _jpeg = None
+
+    @classmethod
+    def update(cls, frame):
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            with cls._lock:
+                cls._jpeg = buf.tobytes()
+
+    @classmethod
+    def get(cls):
+        with cls._lock:
+            return cls._jpeg
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # matikan log di terminal
+            pass
+
+        def do_GET(self):
+            if not self.path.startswith("/stream"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                while True:
+                    jpg = StreamServer.get()
+                    if jpg:
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                         b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n")
+                        self.wfile.write(jpg)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(0.06)  # ± 15 fps
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+    @classmethod
+    def start(cls, port: int):
+        srv = ThreadingHTTPServer(("0.0.0.0", port), cls.Handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"[INFO] Stream kamera: http://127.0.0.1:{port}/stream")
+
 
 # ─── Path setup ─────────────────────────────────────────────────────────────
 import sys
@@ -351,6 +405,8 @@ def main():
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default 0)")
     parser.add_argument("--ip", type=str, default=None, help="URL IP Webcam snapshot")
     parser.add_argument("--laravel", type=str, default="http://127.0.0.1:8000", help="URL server Laravel")
+    parser.add_argument("--stream-port", type=int, default=8090, help="Port stream untuk web")
+    parser.add_argument("--no-window", action="store_true", help="Jangan buka jendela OpenCV, tampil di web saja")
     args = parser.parse_args()
 
     print("=" * 65)
@@ -387,6 +443,7 @@ def main():
 
     # Inisialisasi Background Scan Worker
     worker = ScanWorker()
+    StreamServer.start(args.stream_port)
 
     # State Machine: "SIAGA", "MEMPROSES", "HASIL"
     state_sistem = "SIAGA"
@@ -546,7 +603,7 @@ def main():
                     print(f"[SIAGA] Sistem siap memantau kendaraan berikutnya.\n")
 
             # ── E. Render UI Tampilan Kamera ────────────────────────────────
-            gambar_interface(
+                gambar_interface(
                 frame=frame,
                 state_sistem=state_sistem,
                 target_gate=target_gate,
@@ -557,8 +614,13 @@ def main():
                 interval_detik=SCAN_INTERVAL,
             )
 
-            cv2.imshow("ParkVisi - Sistem Akses Parkir Terpadu", frame)
+            StreamServer.update(frame)   # kirim ke web
 
+            if args.no_window:
+                time.sleep(0.01)
+                continue
+
+            cv2.imshow("ParkVisi - Sistem Akses Parkir Terpadu", frame)
             # ── F. Kontrol Keyboard ─────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
