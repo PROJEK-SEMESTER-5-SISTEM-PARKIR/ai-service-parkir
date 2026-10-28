@@ -9,12 +9,10 @@ Fitur:
   - Palang servo ESP32 otomatis terbuka jika cocok, atau ditolak jika tidak sesuai.
   - Setelah kendaraan lewat, sistem otomatis kembali ke status SIAGA untuk kendaraan berikutnya.
 
-Kontrol Keyboard:
-  [1] / [M]   -> Trigger Manual Pintu Masuk (Simulasi sensor masuk)
-  [2] / [K]   -> Trigger Manual Pintu Keluar (Simulasi sensor keluar)
-  [SPASI]     -> Trigger Manual Gerbang Aktif
-  [R]         -> Reset status gerbang ke SIAGA
-  [Q] / [ESC] -> Keluar dari aplikasi
+Kontrol:
+  - Secara default berjalan dalam mode Web Streaming (tanpa popup window OpenCV/IDLE).
+  - Hasil pemindaian langsung tampil di Web Admin: http://localhost:8000/parkir/kamera
+  - Jika ingin menampilkan popup window OpenCV, gunakan opsi: --window
 """
 import argparse
 import json
@@ -79,7 +77,7 @@ class StreamServer:
         srv = ThreadingHTTPServer(("0.0.0.0", port), cls.Handler)
         srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        print(f"[INFO] Stream kamera: http://127.0.0.1:{port}/stream")
+        print(f"[INFO] Stream kamera aktif: http://127.0.0.1:{port}/stream")
 
 
 # ─── Path setup ─────────────────────────────────────────────────────────────
@@ -314,12 +312,12 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
 
     if state_sistem == "SIAGA":
         warna_header = BIRU_CYAN
-        judul_header = "[SIAGA] MENUNGGU SENSOR KENDARAAN (ESP32)"
-        sub_header = "Sensor ultrasonik masuk/keluar akan otomatis memicu kamera."
+        judul_header = "[SIAGA] MENUNGGU SENSOR KENDARAAN"
+        sub_header = "Sensor ultrasonik, tombol web, atau deteksi kamera akan memicu sistem."
     elif state_sistem == "MEMPROSES":
         warna_header = ORANYE
-        judul_header = f"[MEMPROSES {nama_gate_teks}] SENSOR TERDETEKSI! ({sisa_waktu:.1f}s)"
-        sub_header = f"Sedang memindai wajah & plat kendaraan ({target_gate})..."
+        judul_header = f"[MEMPROSES {nama_gate_teks}] SEDANG MENCOCOKKAN ({sisa_waktu:.1f}s)"
+        sub_header = f"Memindai wajah & plat nomor kendaraan ({target_gate})..."
     elif state_sistem == "HASIL":
         status_verif = verif_result.get("status") if verif_result else "menunggu"
         if status_verif == "izin":
@@ -344,7 +342,7 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
             wx, wy, ww, wh = map(int, scan_result["wajah_box"])
             if scan_result.get("wajah_cocok"):
                 col_w = HIJAU
-                lbl_w = f"Member ID {scan_result['wajah_id']} (d={scan_result['wajah_distance']})"
+                lbl_w = f"Member #{scan_result['wajah_id']} (d={scan_result['wajah_distance']})"
             else:
                 col_w = MERAH if scan_result.get("wajah_ada") else ORANYE
                 lbl_w = f"Wajah Asing (d={scan_result.get('wajah_distance', '-')})"
@@ -368,7 +366,7 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
         w_status = scan_result.get("wajah_cocok") if scan_result else False
         p_status = scan_result.get("plat_valid") if scan_result else False
 
-        txt_w = "✓ Wajah Terdeteksi" if w_status else "⏳ Mencari Wajah..."
+        txt_w = f"✓ Wajah: Member #{scan_result.get('wajah_id')}" if (scan_result and w_status) else ("⏳ Wajah Tidak Cocok" if (scan_result and scan_result.get("wajah_ada")) else "⏳ Mencari Wajah...")
         txt_p = f"✓ Plat: {scan_result.get('plat_text')}" if (scan_result and p_status) else "⏳ Membaca Plat..."
 
         cv2.putText(frame, txt_w, (16, pos_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, HIJAU if w_status else ORANYE, 2)
@@ -386,7 +384,7 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
                         cv2.FONT_HERSHEY_SIMPLEX, 0.58, PUTIH, 2)
             pos_y += 24
 
-    # ── 4. Baris Bawah / Petunjuk Tombol ─────────────────────────────────────
+    # ── 4. Baris Bawah / Status Gerbang ──────────────────────────────────────
     overlay_bot = frame.copy()
     cv2.rectangle(overlay_bot, (0, H - 36), (W, H), HITAM, -1)
     cv2.addWeighted(overlay_bot, 0.75, frame, 0.25, 0, frame)
@@ -394,7 +392,7 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
     info_gate = f"Target: {target_gate} | Izin: {gate_info.get('izin', 'SIAGA')} | Trigger: {gate_info.get('trigger', False)}"
     cv2.putText(frame, info_gate, (16, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.44, BIRU_CYAN, 1)
 
-    petunjuk = "[1]=Masuk  [2]=Keluar  [R]=Reset  [Q]=Keluar"
+    petunjuk = "Web Admin: /parkir/kamera"
     (tw, _), _ = cv2.getTextSize(petunjuk, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
     cv2.putText(frame, petunjuk, (W - tw - 16, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.44, ABU, 1)
 
@@ -405,13 +403,23 @@ def main():
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default 0)")
     parser.add_argument("--ip", type=str, default=None, help="URL IP Webcam snapshot")
     parser.add_argument("--laravel", type=str, default="http://127.0.0.1:8000", help="URL server Laravel")
-    parser.add_argument("--stream-port", type=int, default=8090, help="Port stream untuk web")
-    parser.add_argument("--no-window", action="store_true", help="Jangan buka jendela OpenCV, tampil di web saja")
+    parser.add_argument("--stream-port", type=int, default=8090, help="Port stream untuk web (default 8090)")
+    parser.add_argument("--gate", type=str, default="gate_masuk", choices=["gate_masuk", "gate_keluar"], help="Pintu awal (default: gate_masuk)")
+    parser.add_argument("--window", action="store_true", default=False, help="Buka jendela popup OpenCV GUI (default: False/tanpa popup window)")
+    parser.add_argument("--no-window", action="store_true", default=False, help="Mode tanpa popup window (default: aktif)")
     args = parser.parse_args()
+
+    buka_gui = args.window and not args.no_window
 
     print("=" * 65)
     print("  PARKVISI - SISTEM AKSES PARKIR AI (PINTU MASUK & KELUAR)")
     print("=" * 65)
+    if buka_gui:
+        print("[MODE] Jendela GUI OpenCV aktif.")
+    else:
+        print("[MODE] Web Streaming aktif (Tanpa popup window).")
+        print("       Buka Web Admin di : http://localhost:8000/parkir/kamera")
+        print(f"       Siaran MJPEG di   : http://127.0.0.1:{args.stream_port}/stream")
 
     # 1. Inisialisasi Model LBPH
     print("[1/3] Memuat Model LBPH...")
@@ -447,7 +455,7 @@ def main():
 
     # State Machine: "SIAGA", "MEMPROSES", "HASIL"
     state_sistem = "SIAGA"
-    target_gate = "gate_masuk"
+    target_gate = args.gate
     waktu_mulai_proses = 0.0
     waktu_mulai_hasil = 0.0
     DURASI_MAKS_PROSES = 9.0   # Batas waktu pencarian wajah & plat (detik)
@@ -459,7 +467,7 @@ def main():
 
     last_poll_gate = 0.0
     POLL_INTERVAL = 0.4  # Polling trigger dari ESP32 setiap 0.4 detik
-    gate_state_info = {"izin": "SIAGA", "trigger": False, "gate": "gate_masuk"}
+    gate_state_info = {"izin": "SIAGA", "trigger": False, "gate": target_gate}
 
     last_scan_send = 0.0
     SCAN_INTERVAL = 0.8  # Interval pengiriman frame ke worker
@@ -468,7 +476,10 @@ def main():
     scan_terakhir = None
 
     print("\n[BERJALAN] Sistem otomatis memantau sensor Pintu Masuk & Pintu Keluar.")
-    print("            Tekan [Q] di jendela kamera untuk keluar.\n")
+    if buka_gui:
+        print("           Tekan [Q] di jendela kamera untuk keluar.\n")
+    else:
+        print("           Tekan Ctrl+C di terminal ini untuk berhenti.\n")
 
     try:
         while True:
@@ -505,7 +516,7 @@ def main():
                         "status": data_gate.get("status", "SIAGA"),
                     }
 
-                    # Jika ESP32 mendeteksi kendaraan (baik gate_masuk atau gate_keluar)
+                    # Jika ESP32 / tombol web mendeteksi kendaraan
                     if state_sistem == "SIAGA" and (g_trigger or g_izin == "MENUNGGU"):
                         target_gate = g_name
                         nama_pintu = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
@@ -533,6 +544,18 @@ def main():
             hasil_scan = worker.ambil_hasil()
             if hasil_scan:
                 scan_terakhir = hasil_scan
+
+            # Jika sedang SIAGA dan kamera melihat plat valid atau wajah yang dikenali (auto-trigger kamera)
+            if state_sistem == "SIAGA":
+                if (sekarang - waktu_mulai_hasil >= 3.0) and scan_terakhir:
+                    if scan_terakhir.get("plat_valid") or scan_terakhir.get("wajah_cocok"):
+                        nama_pintu = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
+                        print(f"\n[DETEKSI KAMERA] {nama_pintu}: Objek terdeteksi di kamera! Memulai pencocokan...")
+                        state_sistem = "MEMPROSES"
+                        waktu_mulai_proses = sekarang
+                        history_plat.clear()
+                        history_wajah.clear()
+                        verif_terakhir = None
 
             # ── D. Logika Siklus State Machine ───────────────────────────────
             sisa_waktu = 0.0
@@ -602,8 +625,8 @@ def main():
                     history_wajah.clear()
                     print(f"[SIAGA] Sistem siap memantau kendaraan berikutnya.\n")
 
-            # ── E. Render UI Tampilan Kamera ────────────────────────────────
-                gambar_interface(
+            # ── E. Render UI Tampilan Kamera (selalu dijalankan tiap frame) ───
+            gambar_interface(
                 frame=frame,
                 state_sistem=state_sistem,
                 target_gate=target_gate,
@@ -614,14 +637,16 @@ def main():
                 interval_detik=SCAN_INTERVAL,
             )
 
-            StreamServer.update(frame)   # kirim ke web
+            # Kirim frame dengan overlay deteksi ke stream web
+            StreamServer.update(frame)
 
-            if args.no_window:
+            # Jika mode headless (default), lewati cv2.imshow agar tidak memunculkan window popup
+            if not buka_gui:
                 time.sleep(0.01)
                 continue
 
             cv2.imshow("ParkVisi - Sistem Akses Parkir Terpadu", frame)
-            # ── F. Kontrol Keyboard ─────────────────────────────────────────
+            # ── F. Kontrol Keyboard (Hanya jika GUI aktif) ───────────────────
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
@@ -654,6 +679,8 @@ def main():
                 history_plat.clear()
                 history_wajah.clear()
 
+    except KeyboardInterrupt:
+        print("\n[INFO] Menghentikan sistem (Ctrl+C)...")
     finally:
         if cap:
             cap.release()
