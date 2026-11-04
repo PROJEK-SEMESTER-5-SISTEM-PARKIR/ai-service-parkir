@@ -231,6 +231,9 @@ class ScanWorker:
                 time.sleep(0.01)
 
     def _proses_scan(self, frame) -> dict:
+        # [TAMBAHAN] Catat waktu mulai proses AI untuk mengukur latensi wajah
+        t_mulai_ai = time.time()
+
         res = {
             # Wajah
             "wajah_ada": False,
@@ -244,6 +247,8 @@ class ScanWorker:
             "plat_text": None,
             "plat_conf": 0.0,
             "plat_valid": False,
+            # [TAMBAHAN] Field penyimpanan durasi latensi AI dalam milidetik
+            "latensi_ai_ms": 0.0,
         }
 
         gray = face_preprocess.to_gray(frame)
@@ -284,6 +289,8 @@ class ScanWorker:
         except Exception:
             pass
 
+        # [TAMBAHAN] Hitung durasi latensi AI (dalam milidetik)
+        res["latensi_ai_ms"] = round((time.time() - t_mulai_ai) * 1000, 2)
         return res
 
 
@@ -300,40 +307,47 @@ HITAM     = (20, 20, 20)
 
 def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict,
                      scan_result: dict | None, verif_result: dict | None,
-                     sisa_waktu: float, interval_detik: float):
+                     sisa_waktu: float, interval_detik: float, fps_saat_ini: float = 0.0):
     H, W = frame.shape[:2]
 
     nama_gate_teks = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
 
     # ── 1. Header Banner Atas ────────────────────────────────────────────────
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (W, 70), HITAM, -1)
+    cv2.rectangle(overlay, (0, 0), (W, 90), HITAM, -1)  # Diperlebar sedikit jadi 90 px agar muat 3 baris
     cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
 
     if state_sistem == "SIAGA":
         warna_header = BIRU_CYAN
-        judul_header = "[SIAGA] MENUNGGU SENSOR KENDARAAN"
-        sub_header = "Sensor ultrasonik, tombol web, atau deteksi kamera akan memicu sistem."
+        judul_header = "[SIAGA] MENUNGGU SENSOR"  # Disingkat sedikit agar tidak terlalu panjang
+        sub_header = "Sensor ultrasonik / deteksi kamera siap memicu sistem."
     elif state_sistem == "MEMPROSES":
         warna_header = ORANYE
-        judul_header = f"[MEMPROSES {nama_gate_teks}] SEDANG MENCOCOKKAN ({sisa_waktu:.1f}s)"
-        sub_header = f"Memindai wajah & plat nomor kendaraan ({target_gate})..."
+        judul_header = f"[MEMPROSES {nama_gate_teks}] ({sisa_waktu:.1f}s)"
+        sub_header = f"Memindai wajah & plat nomor..."
     elif state_sistem == "HASIL":
         status_verif = verif_result.get("status") if verif_result else "menunggu"
         if status_verif == "izin":
             warna_header = HIJAU
-            judul_header = f"✓  AKSES {nama_gate_teks} DITERIMA - PALANG DIBUKA"
+            judul_header = f"✓ AKSES {nama_gate_teks} DITERIMA"
         else:
             warna_header = MERAH
-            judul_header = f"✗  AKSES {nama_gate_teks} DITOLAK - PALANG TERTUTUP"
+            judul_header = f"✗ AKSES {nama_gate_teks} DITOLAK"
         sub_header = verif_result.get("keterangan", "") if verif_result else ""
     else:
         warna_header = ABU
         judul_header = f"[{state_sistem}]"
         sub_header = ""
 
-    cv2.putText(frame, judul_header, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.82, warna_header, 2)
-    cv2.putText(frame, sub_header[:95], (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, PUTIH, 1)
+    cv2.putText(frame, judul_header, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, warna_header, 2)
+    cv2.putText(frame, sub_header[:95], (16, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PUTIH, 1)
+
+    # === [PERBAIKAN POSISI] Tampilkan FPS & Latensi di Pojok Kanan Atas dengan rapi ===
+    lat_teks = f"Latensi AI: {scan_result.get('latensi_ai_ms', 0):.1f} ms" if scan_result else "Latensi AI: 0 ms"
+    fps_teks = f"FPS: {fps_saat_ini:.1f}"
+    
+    cv2.putText(frame, fps_teks, (W - 160, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, KUNING, 2)
+    cv2.putText(frame, lat_teks, (W - 240, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.48, BIRU_CYAN, 1)
 
     # ── 2. Bounding Box Hasil Pemindaian Kamera ──────────────────────────────
     if scan_result:
@@ -475,6 +489,10 @@ def main():
     verif_terakhir = None
     scan_terakhir = None
 
+    # [TAMBAHAN] Variabel pelacak waktu untuk perhitungan FPS real-time
+    waktu_frame_sebelumnya = time.time()
+    fps_terhitung = 0.0
+
     print("\n[BERJALAN] Sistem otomatis memantau sensor Pintu Masuk & Pintu Keluar.")
     if buka_gui:
         print("           Tekan [Q] di jendela kamera untuk keluar.\n")
@@ -483,6 +501,13 @@ def main():
 
     try:
         while True:
+            # [TAMBAHAN] Hitung FPS real-time berdasarkan jeda waktu antar frame
+            sekarang = time.time()
+            delta_waktu = sekarang - waktu_frame_sebelumnya
+            if delta_waktu > 0:
+                fps_terhitung = 1.0 / delta_waktu
+            waktu_frame_sebelumnya = sekarang
+
             # ── A. Ambil Frame Kamera ────────────────────────────────────────
             if args.ip:
                 frame = baca_ipcam(args.ip)
@@ -496,8 +521,6 @@ def main():
                     continue
                 if not ok or frame is None or frame.size == 0:
                     continue
-
-            sekarang = time.time()
 
             # ── B. Polling Status Gate ESP32 dari Laravel ────────────────────
             if sekarang - last_poll_gate >= POLL_INTERVAL:
@@ -635,6 +658,7 @@ def main():
                 verif_result=verif_terakhir,
                 sisa_waktu=sisa_waktu,
                 interval_detik=SCAN_INTERVAL,
+                fps_saat_ini=fps_terhitung,  # [TAMBAHAN] Kirim nilai FPS ke UI
             )
 
             # Kirim frame dengan overlay deteksi ke stream web
@@ -689,4 +713,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()  
