@@ -91,6 +91,72 @@ def _jumlah_karakter(gray_crop):
 
 
 # ---------------------------------------------------------------------------
+# Buang baris masa berlaku (bulan/tahun) dari crop plat — Step 07
+# ---------------------------------------------------------------------------
+def _buang_baris_masa_berlaku(crop_bgr):
+    """Potong bagian bawah crop plat yang berisi baris masa berlaku (mis. '05 26').
+
+    Algoritma proyeksi horizontal (versi perbaikan):
+      1. Binerisasi Otsu -> cek hanya area TENGAH crop untuk menentukan orientasi
+         (hindari pengaruh border gelap di tepi).
+      2. Hitung piksel gelap hanya di ZONA DALAM horizontal (abaikan 12% tepi
+         kiri/kanan) supaya border tepi tidak mempengaruhi deteksi celah.
+      3. Haluskan proyeksi dengan rata-rata bergerak.
+      4. Cari celah PERTAMA di zona 50-85% tinggi crop -> titik potong.
+      5. Fallback: jika tidak ada celah, potong paksa di 78% tinggi (masa berlaku
+         selalu di bawah ~22% plat nomor Indonesia).
+    """
+    if crop_bgr is None:
+        return crop_bgr
+    h, w = crop_bgr.shape[:2]
+    if h < 20 or w < 20:
+        return crop_bgr
+
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    _, biner = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Cek orientasi hanya di area tengah crop (hindari border gelap tepi)
+    # supaya plat dengan border tebal tidak salah diinvert
+    tengah = biner[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
+    if tengah.mean() < 127:
+        biner = cv2.bitwise_not(biner)
+
+    # Hitung proyeksi horizontal hanya di zona dalam (buang 12% tepi kiri/kanan)
+    # sehingga border samping plat tidak menambah piksel gelap pada baris "celah"
+    margin_x = max(2, int(0.12 * w))
+    proj = (biner[:, margin_x: w - margin_x] < 127).sum(axis=1).astype(np.float32)
+    lebar_dalam = w - 2 * margin_x
+
+    # Rata-rata bergerak untuk menghaluskan noise
+    k = max(1, h // 20)
+    kernel = np.ones(k, dtype=np.float32) / k
+    proj_smooth = np.convolve(proj, kernel, mode='same')
+
+    # Zona pencarian: 50% - 85% tinggi crop
+    y_min = int(0.50 * h)
+    y_max = int(0.85 * h)
+    # Celah = baris dengan piksel karakter < 5% lebar zona dalam
+    thr = 0.05 * lebar_dalam
+
+    potong_y = None
+    for y in range(y_min, y_max):
+        if proj_smooth[y] < thr:
+            potong_y = y
+            break
+
+    if potong_y is not None and potong_y > int(0.40 * h):
+        return crop_bgr[:potong_y, :]
+
+    # Fallback: potong paksa di 78% tinggi jika celah tidak terdeteksi
+    # (baris masa berlaku selalu menempati ~20-22% bawah plat Indonesia)
+    potong_fallback = int(0.78 * h)
+    if potong_fallback > int(0.40 * h):
+        return crop_bgr[:potong_fallback, :]
+
+    return crop_bgr
+
+
+# ---------------------------------------------------------------------------
 # Sumber 1: tepi + kontur
 # ---------------------------------------------------------------------------
 def _dari_tepi(img, gray_c, H, W):
@@ -221,6 +287,8 @@ def find_plate_candidates(img, debug=None):
 
     # Nilai ISI kandidat: jumlah karakter di dalam crop
     for k in kandidat:
+        # Buang baris masa berlaku dari setiap kandidat sebelum penilaian
+        k["crop"] = _buang_baris_masa_berlaku(k["crop"])
         nchar = _jumlah_karakter(cv2.cvtColor(k["crop"], cv2.COLOR_BGR2GRAY))
         k["nchar"] = nchar
         faktor = 1.0 + min(nchar, 8) / 4 if 4 <= nchar <= 10 else 0.3
