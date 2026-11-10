@@ -3,63 +3,17 @@ from datetime import datetime
 
 from flask import Blueprint, jsonify, request
 
-from app.config import (AUGMENT, DEBUG_DIR, MIN_VALID_FRAMES, PHONE_CAMERA_URL,
-                        UNKNOWN_THRESHOLD)
-from app.intelligence import dataset, lbph
-from app.vision import face_detector, face_preprocess, plate_reader
-from app.vision.face_detector import detect_face
-from app.vision.face_preprocess import crop_face, decode_image, normalize, to_gray
+from app.config import (DEBUG_DIR, MEMBER_MAP, PHONE_CAMERA_URL,
+                        YOLO_ACCEPT_CONF)
+from app.vision import plate_reader, yolo_recognizer
+from app.vision.face_preprocess import decode_image
 
 bp = Blueprint("api", __name__)
 
 
-def _prepare_face(file):
-    """Citra mentah -> Haar cascade (cari wajah) -> crop -> normalisasi. Return (wajah, pesan_error)."""
-    img = face_preprocess.decode_image(file.read())
-    if img is None:
-        return None, "File bukan gambar yang valid."
-    gray = face_preprocess.to_gray(img)
-    box = face_detector.detect_face(gray)
-    if box is None:
-        return None, "Wajah tidak terdeteksi. Pastikan wajah menghadap kamera dan cukup terang."
-    return face_preprocess.normalize(face_preprocess.crop_face(gray, box)), None
-
-
-@bp.post("/enroll")
-def enroll():
-    member_id = request.form.get("member_id", "")
-    # Laravel mengirim banyak frame dengan nama field "photos".
-    # "photo" tetap diterima supaya klien lama (satu foto) tidak rusak.
-    files = request.files.getlist("photos") or request.files.getlist("photo")
-
-    if not member_id.isdigit():
-        return jsonify(error="member_id tidak valid."), 422
-    if not files:
-        return jsonify(error="Foto tidak ditemukan."), 422
-
-    # Seperti registrasi.py: hanya frame yang wajahnya terdeteksi Haar cascade yang dipakai.
-    # Frame tanpa wajah dilewati, bukan menggagalkan seluruh pendaftaran.
-    samples, used = [], 0
-    for f in files:
-        face, err = _prepare_face(f)
-        if err:
-            continue
-        used += 1
-        samples.extend(face_preprocess.augment(face) if AUGMENT else [face])
-
-    required = min(MIN_VALID_FRAMES, len(files))
-    if used < required:
-        return jsonify(error=(
-            f"Wajah hanya terdeteksi di {used} dari {len(files)} foto (minimal {required}). "
-            "Pastikan wajah terlihat jelas, cukup terang, dan menghadap kamera lalu ambil foto ulang."
-        )), 422
-
-    saved = dataset.save_samples(int(member_id), samples)
-    total = lbph.train()
-    return jsonify(member_id=int(member_id), frames=len(files), faces_used=used,
-                   samples=saved, trained_images=total)
-
-
+# ---------------------------------------------------------------------------
+# WAJAH (YOLO)
+# ---------------------------------------------------------------------------
 @bp.post("/detect")
 def detect():
     f = request.files.get("photo")
@@ -68,25 +22,16 @@ def detect():
     img = decode_image(f.read())
     if img is None:
         return jsonify(face=False)
-    return jsonify(face=detect_face(to_gray(img)) is not None)
-
-
-@bp.delete("/members/<int:member_id>")
-def remove_member(member_id):
-    dataset.delete_member(member_id)
-    return jsonify(trained_images=lbph.train())
+    return jsonify(face=yolo_recognizer.predict(img) is not None)
 
 
 @bp.post("/recognize")
 def recognize():
-    """Kenali wajah dari foto yang dikirim.
+    """Kenali wajah dengan YOLO.
 
-    Response JSON:
-      face_detected (bool)  - apakah ada wajah di frame
-      matched (bool)        - apakah cocok dengan member terdaftar
-      member_id (int|null)  - ID member jika matched
-      distance (float|null) - jarak LBPH (makin kecil = makin mirip)
-      warning (str|null)    - pesan peringatan jika tidak cocok / tidak terdeteksi
+    Response JSON (format sama seperti sebelumnya):
+      face_detected, matched, member_id, distance, warning
+    Tambahan: confidence, predicted_name
     """
     file = request.files.get("photo")
     if file is None:
@@ -96,44 +41,49 @@ def recognize():
     if img is None:
         return jsonify(error="File bukan gambar yang valid."), 422
 
-    gray = to_gray(img)
-    box = detect_face(gray)
+    result = yolo_recognizer.predict(img)
 
-    # ── Wajah tidak terdeteksi di frame ────────────────────────────────────
-    if box is None:
+    if result is None:
         return jsonify(
-            face_detected=False,
-            matched=False,
-            member_id=None,
-            distance=None,
+            face_detected=False, matched=False, member_id=None, distance=None,
             warning="Wajah tidak terdeteksi dalam frame. "
                     "Pastikan wajah menghadap kamera dan cukup terang."
         ), 200
 
-    # ── Wajah terdeteksi → cocokkan dengan model LBPH ──────────────────────
-    face = normalize(crop_face(gray, box))
-
-    result = lbph.predict(face)
-    if result is None:
-        return jsonify(error="Model belum dilatih."), 503
-
-    member_id, distance = result
-    matched = distance <= UNKNOWN_THRESHOLD
+    nama, conf = result
+    member_id = MEMBER_MAP.get(nama)
+    matched = member_id is not None and conf >= YOLO_ACCEPT_CONF
 
     return jsonify(
         face_detected=True,
         matched=matched,
-        member_id=int(member_id) if matched else None,
-        distance=round(distance, 2),
+        member_id=member_id if matched else None,
+        distance=round(1 - conf, 3),
+        confidence=round(conf, 3),
+        predicted_name=nama,
         warning=None if matched else (
             "Wajah terdeteksi tetapi tidak cocok dengan member manapun (orang asing / belum terdaftar)."
-        )
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# STUB: endpoint lama LBPH (hanya kalau Laravel masih memanggilnya)
+# Hapus blok ini kalau sudah dipastikan tidak ada pemanggil.
+# ---------------------------------------------------------------------------
+@bp.post("/enroll")
+def enroll():
+    return jsonify(message="Pendaftaran wajah via web dinonaktifkan. Member dilatih lewat YOLO."), 410
 
 
 @bp.post("/retrain")
 def retrain():
-    return jsonify(trained_images=lbph.train())
+    return jsonify(message="Tidak ada retrain di server. Model YOLO dilatih di luar."), 410
+
+
+@bp.delete("/members/<int:member_id>")
+def remove_member(member_id):
+    return jsonify(message="Tidak ada data member di AI service."), 410
 
 
 @bp.get("/health")
@@ -142,14 +92,14 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# PLAT NOMOR
+# PLAT NOMOR (tidak diubah)
 # ---------------------------------------------------------------------------
 def _baca_plat(img):
     """Jalankan alur plat; tambahkan ?debug=1 untuk menyimpan gambar tiap langkah."""
     debug = {} if request.args.get("debug") else None
     try:
         hasil = plate_reader.read_plate(img, debug)
-    except RuntimeError as e:          # OCR belum terpasang
+    except RuntimeError as e:
         return jsonify(success=False, message=str(e)), 503
     if debug:
         folder = DEBUG_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")

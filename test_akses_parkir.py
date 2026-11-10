@@ -1,6 +1,9 @@
 """
 Verifikasi Akses Parkir Terpadu (Kamera AI + ESP32 IoT Pintu Masuk & Keluar).
 
+Pengenalan wajah: YOLO (best.pt)  -- menggantikan LBPH.
+Pembacaan plat   : tidak berubah.
+
 Fitur:
   - Berjalan terus-menerus (otomatis) tanpa perlu dijalankan berulang kali.
   - Mendukung Pintu Masuk (gate_masuk) dan Pintu Keluar (gate_keluar).
@@ -85,9 +88,8 @@ import sys
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
 
-from app.config import UNKNOWN_THRESHOLD
-from app.intelligence import lbph
-from app.vision import face_detector, face_preprocess
+from app.config import MEMBER_MAP, YOLO_ACCEPT_CONF
+from app.vision import yolo_recognizer
 from app.vision.plate_reader import read_plate, save_debug
 
 DEBUG_DIR = Path("data/debug")
@@ -231,7 +233,7 @@ class ScanWorker:
                 time.sleep(0.01)
 
     def _proses_scan(self, frame) -> dict:
-        # [TAMBAHAN] Catat waktu mulai proses AI untuk mengukur latensi wajah
+        # Catat waktu mulai proses AI untuk mengukur latensi
         t_mulai_ai = time.time()
 
         res = {
@@ -239,40 +241,38 @@ class ScanWorker:
             "wajah_ada": False,
             "wajah_box": None,
             "wajah_id": None,
-            "wajah_distance": None,
+            "wajah_distance": None,   # dibuat = 1 - confidence (makin kecil makin yakin)
             "wajah_cocok": False,
+            "wajah_nama": None,       # nama kelas hasil tebakan YOLO
+            "wajah_conf": 0.0,        # confidence YOLO (0..1)
             # Plat
             "plat_ada": False,
             "plat_box": None,
             "plat_text": None,
             "plat_conf": 0.0,
             "plat_valid": False,
-            # [TAMBAHAN] Field penyimpanan durasi latensi AI dalam milidetik
+            # Durasi latensi AI dalam milidetik
             "latensi_ai_ms": 0.0,
         }
 
-        gray = face_preprocess.to_gray(frame)
+        # 1. Deteksi & Pengenalan Wajah (YOLO)
+        try:
+            d = yolo_recognizer.predict_detail(frame)
+            if d is not None:
+                res["wajah_ada"] = True
+                res["wajah_box"] = d["box"]
+                res["wajah_nama"] = d["name"]
+                res["wajah_conf"] = round(d["conf"], 3)
+                res["wajah_distance"] = round(1 - d["conf"], 3)
 
-        # 1. Deteksi Wajah
-        box_wajah = face_detector.detect_face(gray)
-        if box_wajah is not None:
-            res["wajah_ada"] = True
-            res["wajah_box"] = box_wajah
-            try:
-                face_norm = face_preprocess.normalize(
-                    face_preprocess.crop_face(gray, box_wajah)
-                )
-                pred = lbph.predict(face_norm)
-                if pred is not None:
-                    mid, dist = pred
-                    res["wajah_distance"] = round(dist, 1)
-                    if dist <= UNKNOWN_THRESHOLD:
-                        res["wajah_cocok"] = True
-                        res["wajah_id"] = int(mid)
-            except Exception:
-                pass
+                member_id = MEMBER_MAP.get(d["name"])
+                if member_id is not None and d["conf"] >= YOLO_ACCEPT_CONF:
+                    res["wajah_cocok"] = True
+                    res["wajah_id"] = int(member_id)
+        except Exception as e:
+            print(f"[YOLO] {e}")
 
-        # 2. Pembacaan Plat Nomor
+        # 2. Pembacaan Plat Nomor (tidak diubah)
         dbg = {}
         try:
             plate_res = read_plate(frame, dbg, fast=True)
@@ -289,7 +289,7 @@ class ScanWorker:
         except Exception:
             pass
 
-        # [TAMBAHAN] Hitung durasi latensi AI (dalam milidetik)
+        # Hitung durasi latensi AI (dalam milidetik)
         res["latensi_ai_ms"] = round((time.time() - t_mulai_ai) * 1000, 2)
         return res
 
@@ -314,17 +314,17 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
 
     # ── 1. Header Banner Atas ────────────────────────────────────────────────
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (W, 90), HITAM, -1)  # Diperlebar sedikit jadi 90 px agar muat 3 baris
+    cv2.rectangle(overlay, (0, 0), (W, 90), HITAM, -1)
     cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
 
     if state_sistem == "SIAGA":
         warna_header = BIRU_CYAN
-        judul_header = "[SIAGA] MENUNGGU SENSOR"  # Disingkat sedikit agar tidak terlalu panjang
+        judul_header = "[SIAGA] MENUNGGU SENSOR"
         sub_header = "Sensor ultrasonik / deteksi kamera siap memicu sistem."
     elif state_sistem == "MEMPROSES":
         warna_header = ORANYE
         judul_header = f"[MEMPROSES {nama_gate_teks}] ({sisa_waktu:.1f}s)"
-        sub_header = f"Memindai wajah & plat nomor..."
+        sub_header = "Memindai wajah & plat nomor..."
     elif state_sistem == "HASIL":
         status_verif = verif_result.get("status") if verif_result else "menunggu"
         if status_verif == "izin":
@@ -342,10 +342,10 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
     cv2.putText(frame, judul_header, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, warna_header, 2)
     cv2.putText(frame, sub_header[:95], (16, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, PUTIH, 1)
 
-    # === [PERBAIKAN POSISI] Tampilkan FPS & Latensi di Pojok Kanan Atas dengan rapi ===
+    # FPS & Latensi di pojok kanan atas
     lat_teks = f"Latensi AI: {scan_result.get('latensi_ai_ms', 0):.1f} ms" if scan_result else "Latensi AI: 0 ms"
     fps_teks = f"FPS: {fps_saat_ini:.1f}"
-    
+
     cv2.putText(frame, fps_teks, (W - 160, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, KUNING, 2)
     cv2.putText(frame, lat_teks, (W - 240, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.48, BIRU_CYAN, 1)
 
@@ -354,12 +354,13 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
         # Kotak Wajah
         if scan_result.get("wajah_box") is not None:
             wx, wy, ww, wh = map(int, scan_result["wajah_box"])
+            conf_pct = scan_result.get("wajah_conf", 0) * 100
             if scan_result.get("wajah_cocok"):
                 col_w = HIJAU
-                lbl_w = f"Member #{scan_result['wajah_id']} (d={scan_result['wajah_distance']})"
+                lbl_w = f"Member #{scan_result['wajah_id']} ({conf_pct:.0f}%)"
             else:
                 col_w = MERAH if scan_result.get("wajah_ada") else ORANYE
-                lbl_w = f"Wajah Asing (d={scan_result.get('wajah_distance', '-')})"
+                lbl_w = f"Wajah Asing ({scan_result.get('wajah_nama')} {conf_pct:.0f}%)"
 
             cv2.rectangle(frame, (wx, wy), (wx + ww, wy + wh), col_w, 2)
             cv2.putText(frame, lbl_w, (wx, max(wy - 8, 85)),
@@ -435,12 +436,17 @@ def main():
         print("       Buka Web Admin di : http://localhost:8000/parkir/kamera")
         print(f"       Siaran MJPEG di   : http://127.0.0.1:{args.stream_port}/stream")
 
-    # 1. Inisialisasi Model LBPH
-    print("[1/3] Memuat Model LBPH...")
-    if not lbph.load_model():
-        print("[WARN] Model LBPH belum ada. Pastikan sudah ada wajah member terdaftar.")
-    else:
-        print("[INFO] Model LBPH siap digunakan.")
+    # 1. Inisialisasi Model YOLO
+    print("[1/3] Memuat Model YOLO...")
+    try:
+        yolo_recognizer.load()
+        # pemanasan, supaya scan pertama tidak lambat
+        yolo_recognizer.predict_detail(np.zeros((480, 640, 3), np.uint8))
+        print("[INFO] Model YOLO siap digunakan.")
+    except Exception as e:
+        print(f"[ERROR] Model YOLO gagal dimuat: {e}")
+        print("        Cek YOLO_MODEL_PATH di config.py dan pastikan models/best.pt ada.")
+        return
 
     # 2. Hubungkan ke API Laravel
     print(f"[2/3] Menghubungkan ke Laravel di {args.laravel}...")
@@ -450,7 +456,7 @@ def main():
         print(f"[WARN] Gagal terhubung ke Laravel: {cek.get('message')}")
         print("       Pastikan 'php artisan serve --host 0.0.0.0 --port 8000' aktif.")
     else:
-        print(f"[INFO] Terhubung ke Laravel API ✓")
+        print("[INFO] Terhubung ke Laravel API ✓")
 
     # 3. Buka Kamera
     print("[3/3] Membuka kamera...")
@@ -475,6 +481,9 @@ def main():
     DURASI_MAKS_PROSES = 9.0   # Batas waktu pencarian wajah & plat (detik)
     DURASI_TAMPIL_HASIL = 5.0  # Durasi tampil banner hasil sebelum kembali siaga
 
+    # Syarat member diakui: nama yang sama harus muncul di >= 60% frame wajah
+    RASIO_VOTE_WAJAH = 0.6
+
     # Buffer stabilisasi
     history_plat = deque(maxlen=6)
     history_wajah = deque(maxlen=6)
@@ -489,7 +498,7 @@ def main():
     verif_terakhir = None
     scan_terakhir = None
 
-    # [TAMBAHAN] Variabel pelacak waktu untuk perhitungan FPS real-time
+    # Variabel pelacak waktu untuk perhitungan FPS real-time
     waktu_frame_sebelumnya = time.time()
     fps_terhitung = 0.0
 
@@ -501,7 +510,7 @@ def main():
 
     try:
         while True:
-            # [TAMBAHAN] Hitung FPS real-time berdasarkan jeda waktu antar frame
+            # Hitung FPS real-time berdasarkan jeda waktu antar frame
             sekarang = time.time()
             delta_waktu = sekarang - waktu_frame_sebelumnya
             if delta_waktu > 0:
@@ -568,7 +577,7 @@ def main():
             if hasil_scan:
                 scan_terakhir = hasil_scan
 
-            # Jika sedang SIAGA dan kamera melihat plat valid atau wajah yang dikenali (auto-trigger kamera)
+            # Jika sedang SIAGA dan kamera melihat plat valid atau wajah member (auto-trigger kamera)
             if state_sistem == "SIAGA":
                 if (sekarang - waktu_mulai_hasil >= 3.0) and scan_terakhir:
                     if scan_terakhir.get("plat_valid") or scan_terakhir.get("wajah_cocok"):
@@ -611,7 +620,11 @@ def main():
                 if history_wajah:
                     mids = [m for m, d in history_wajah if m is not None]
                     if mids:
-                        final_mid = Counter(mids).most_common(1)[0][0]
+                        kandidat, jumlah = Counter(mids).most_common(1)[0]
+                        # Member diakui hanya kalau konsisten di >= RASIO_VOTE_WAJAH frame.
+                        # Tanpa kelas unknown, satu frame yang kebetulan cocok tidak boleh meloloskan orang.
+                        if jumlah >= 2 and jumlah / len(history_wajah) >= RASIO_VOTE_WAJAH:
+                            final_mid = kandidat
                     dists = [d for m, d in history_wajah if d is not None]
                     if dists:
                         final_dist = float(np.median(dists))
@@ -646,7 +659,7 @@ def main():
                     verif_terakhir = None
                     history_plat.clear()
                     history_wajah.clear()
-                    print(f"[SIAGA] Sistem siap memantau kendaraan berikutnya.\n")
+                    print("[SIAGA] Sistem siap memantau kendaraan berikutnya.\n")
 
             # ── E. Render UI Tampilan Kamera (selalu dijalankan tiap frame) ───
             gambar_interface(
@@ -658,7 +671,7 @@ def main():
                 verif_result=verif_terakhir,
                 sisa_waktu=sisa_waktu,
                 interval_detik=SCAN_INTERVAL,
-                fps_saat_ini=fps_terhitung,  # [TAMBAHAN] Kirim nilai FPS ke UI
+                fps_saat_ini=fps_terhitung,
             )
 
             # Kirim frame dengan overlay deteksi ke stream web
@@ -713,4 +726,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  
+    main()

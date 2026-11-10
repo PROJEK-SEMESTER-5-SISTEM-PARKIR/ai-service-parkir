@@ -2,21 +2,29 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
-DATASET_DIR = DATA_DIR / "faces"
-MODEL_PATH = DATA_DIR / "models" / "lbph.yml"
 
+# ---------------------------------------------------------------------------
+# WAJAH (YOLO)
+# ---------------------------------------------------------------------------
+YOLO_MODEL_PATH = DATA_DIR / "models" / "best.pt"
+
+YOLO_MIN_CONF = 0.25       # ambang deteksi kotak (di bawah ini diabaikan)
+YOLO_ACCEPT_CONF = 0.90    # ambang diterima sebagai member. Ganti dengan hasil kalibrasi:
+                           # naikkan kalau orang asing masih lolos, turunkan kalau member sering ditolak
+
+# Nama kelas di model YOLO -> member_id di database Laravel.
+# Kunci HARUS persis sama dengan nama kelas di model (cek: YOLO('models/best.pt').names)
+MEMBER_MAP = {
+    "Achmad-Ramadhani": 1,          # <-- GANTI angka dengan member_id asli di database
+    "Dimas-Dwi-Nugroho": 2,
+    "Dimas-Febrian-Firjatullah": 3,
+    "Firdo-Al-Farobbi": 4,
+    "Rintan-Nur-Wardani": 5,
+}
+
+# Masih dipakai face_preprocess.py / face_detector.py (jangan hapus dulu kalau file itu masih ada)
 FACE_SIZE = (200, 200)
 MIN_FACE_PX = 80
-LBPH_PARAMS = dict(radius=1, neighbors=8, grid_x=8, grid_y=8)
-UNKNOWN_THRESHOLD = 70.0   # makin kecil makin ketat; 55 lebih aman untuk 1 member terdaftar
-# Catatan kalibrasi: wajah orang SAMA biasanya distance 30-50, wajah BERBEDA > 60-80.
-# Turunkan lagi (mis. 50) jika masih salah kenali, naikkan jika wajah sendiri sering ditolak.
-
-# Pendaftaran: browser mengirim ~30 frame, tidak semuanya berisi wajah.
-MIN_VALID_FRAMES = 30      # minimal frame yang wajahnya terdeteksi Haar cascade
-# Dengan 30 frame asli, augmentasi tidak wajib. Tiap citra training memakan
-# ~64 KB di model (grid 8x8), jadi augmentasi mempercepat membengkaknya model.
-AUGMENT = False
 
 # ---------------------------------------------------------------------------
 # PLAT NOMOR (teknik konvensional + OCR)
@@ -49,8 +57,8 @@ TESSERACT_DIR = Path(r"C:\Program Files\Tesseract-OCR")   # folder hasil instala
 PLATE_TESSERACT_CMD = str(TESSERACT_DIR / "tesseract.exe")
 PLATE_TESSDATA_DIR = str(TESSERACT_DIR / "tessdata")
 PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-PLATE_MIN_CONFIDENCE = 0.45             # dinaikkan: di bawah ini dianggap tidak yakin
-PLATE_EARLY_STOP = 0.75                 # dinaikkan: berhenti mencoba kandidat lain hanya bila sudah sangat yakin
+PLATE_MIN_CONFIDENCE = 0.45             # di bawah ini dianggap tidak yakin
+PLATE_EARLY_STOP = 0.75                 # berhenti mencoba kandidat lain hanya bila sudah sangat yakin
 PLATE_LENGTH = (4, 9)                   # jumlah karakter (tanpa spasi) yang masuk akal
 
 # PSM mode Tesseract yang dicoba per varian (makin banyak = makin akurat, makin lambat)
