@@ -16,7 +16,22 @@ Kontrol:
   - Secara default berjalan dalam mode Web Streaming (tanpa popup window OpenCV/IDLE).
   - Hasil pemindaian langsung tampil di Web Admin: http://localhost:8000/parkir/kamera
   - Jika ingin menampilkan popup window OpenCV, gunakan opsi: --window
+
+Perubahan performa (anti-lag):
+  - Baca kamera dijalankan di thread sendiri (FrameGrabber), loop utama selalu dapat frame terbaru.
+  - Polling status gerbang ke Laravel dijalankan di thread sendiri (GatePoller),
+    jadi Laravel yang lambat tidak lagi membekukan video.
+  - Jumlah thread CPU untuk OpenCV / OpenMP / torch dibatasi supaya thread utama tidak kelaparan.
+  - Saat SIAGA, scan AI hanya tiap 2 detik (saat MEMPROSES tetap 0.8 detik).
+  - Hasil scan dihitung SEKALI per scan (bukan tiap iterasi loop) dan hanya scan yang
+    dimulai setelah proses dimulai yang dipakai untuk voting.
 """
+import os
+
+# Batasi thread numerik SEBELUM cv2 / numpy / torch di-import.
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
 import argparse
 import json
 import threading
@@ -30,12 +45,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
+cv2.setNumThreads(2)
+
 
 # ─── Server Stream MJPEG (untuk ditampilkan di web Laravel) ──────────────────
 class StreamServer:
     """Menyiarkan frame terakhir (sudah ada kotak wajah/plat) lewat HTTP."""
     _lock = threading.Lock()
     _jpeg = None
+    _ver = 0
 
     @classmethod
     def update(cls, frame):
@@ -43,11 +61,12 @@ class StreamServer:
         if ok:
             with cls._lock:
                 cls._jpeg = buf.tobytes()
+                cls._ver += 1
 
     @classmethod
     def get(cls):
         with cls._lock:
-            return cls._jpeg
+            return cls._jpeg, cls._ver
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # matikan log di terminal
@@ -63,15 +82,18 @@ class StreamServer:
             self.send_header("Cache-Control", "no-cache, no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+            last_ver = -1
             try:
                 while True:
-                    jpg = StreamServer.get()
-                    if jpg:
+                    jpg, ver = StreamServer.get()
+                    # kirim hanya kalau ada frame baru (hemat bandwidth & CPU)
+                    if jpg and ver != last_ver:
+                        last_ver = ver
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
                                          b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n")
                         self.wfile.write(jpg)
                         self.wfile.write(b"\r\n")
-                    time.sleep(0.06)  # ± 15 fps
+                    time.sleep(0.02)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
@@ -87,6 +109,13 @@ class StreamServer:
 import sys
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
+
+# Batasi thread torch (dipakai ultralytics) bila tersedia.
+try:
+    import torch
+    torch.set_num_threads(4)
+except Exception:
+    pass
 
 from app.config import MEMBER_MAP, YOLO_ACCEPT_CONF
 from app.vision import yolo_recognizer
@@ -175,6 +204,10 @@ def buka_kamera(index: int):
                 if not ok2 or fr2 is None or fr2.size == 0:
                     cap.release()
                     continue
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # kurangi antrean frame lama
+            except Exception:
+                pass
             print(f"[INFO] Kamera terbuka (backend {nm})")
             return cap
         except Exception as e:
@@ -191,6 +224,69 @@ def baca_ipcam(url: str):
         return None
 
 
+# ─── Thread: baca kamera ────────────────────────────────────────────────────
+class FrameGrabber:
+    """Baca kamera di thread sendiri; loop utama selalu mendapat frame TERBARU."""
+
+    def __init__(self, cap=None, ip_url: str | None = None):
+        self.cap = cap
+        self.ip = ip_url
+        self._lock = threading.Lock()
+        self._frame = None
+        self._seq = 0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            if self.ip:
+                f = baca_ipcam(self.ip)
+                ok = f is not None
+            else:
+                try:
+                    ok, f = self.cap.read()
+                except cv2.error:
+                    ok, f = False, None
+                ok = bool(ok) and f is not None and f.size > 0
+
+            if ok:
+                with self._lock:
+                    self._frame = f
+                    self._seq += 1
+            else:
+                time.sleep(0.02)
+
+    def latest(self, last_seq: int):
+        """Return (frame_baru, seq). frame None kalau belum ada frame baru."""
+        with self._lock:
+            if self._frame is None or self._seq == last_seq:
+                return None, last_seq
+            return self._frame.copy(), self._seq
+
+
+# ─── Thread: polling status gerbang ke Laravel ──────────────────────────────
+class GatePoller:
+    """Polling status gerbang di thread sendiri supaya Laravel yang lambat tidak memblokir video."""
+
+    def __init__(self, api: LaravelGateAPI, interval: float = 0.4):
+        self.api = api
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._data = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            res = self.api.cek_status_gate()
+            if not res.get("error"):
+                with self._lock:
+                    self._data = res.get("data", {}) or {}
+            time.sleep(self.interval)
+
+    def latest(self):
+        with self._lock:
+            return self._data
+
+
 # ─── Thread Worker Pemindaian Wajah & Plat ──────────────────────────────────
 class ScanWorker:
     """Thread background untuk mendeteksi wajah & membaca plat secara non-blocking."""
@@ -200,6 +296,7 @@ class ScanWorker:
         self._input_frame = None
         self._hasil = None
         self._busy = False
+        self._seq = 0
         threading.Thread(target=self._loop, daemon=True).start()
 
     def kirim_frame(self, frame):
@@ -213,7 +310,7 @@ class ScanWorker:
 
     def is_busy(self):
         with self._lock:
-            return self._busy
+            return self._busy or self._input_frame is not None
 
     def _loop(self):
         while True:
@@ -227,6 +324,8 @@ class ScanWorker:
             if frame is not None:
                 hasil = self._proses_scan(frame)
                 with self._lock:
+                    self._seq += 1
+                    hasil["seq"] = self._seq
                     self._hasil = hasil
                     self._busy = False
             else:
@@ -237,6 +336,9 @@ class ScanWorker:
         t_mulai_ai = time.time()
 
         res = {
+            # Penanda scan (dipakai loop utama agar tiap scan dihitung sekali)
+            "seq": 0,
+            "t_mulai": t_mulai_ai,
             # Wajah
             "wajah_ada": False,
             "wajah_box": None,
@@ -307,7 +409,8 @@ HITAM     = (20, 20, 20)
 
 def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict,
                      scan_result: dict | None, verif_result: dict | None,
-                     sisa_waktu: float, interval_detik: float, fps_saat_ini: float = 0.0):
+                     sisa_waktu: float, interval_detik: float, fps_saat_ini: float = 0.0,
+                     mirror: bool = False):
     H, W = frame.shape[:2]
 
     nama_gate_teks = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
@@ -327,12 +430,13 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
         sub_header = "Memindai wajah & plat nomor..."
     elif state_sistem == "HASIL":
         status_verif = verif_result.get("status") if verif_result else "menunggu"
+        # cv2.putText hanya mendukung ASCII; simbol Unicode tampil sebagai "?"
         if status_verif == "izin":
             warna_header = HIJAU
-            judul_header = f"✓ AKSES {nama_gate_teks} DITERIMA"
+            judul_header = f"[OK] AKSES {nama_gate_teks} DITERIMA"
         else:
             warna_header = MERAH
-            judul_header = f"✗ AKSES {nama_gate_teks} DITOLAK"
+            judul_header = f"[X] AKSES {nama_gate_teks} DITOLAK"
         sub_header = verif_result.get("keterangan", "") if verif_result else ""
     else:
         warna_header = ABU
@@ -354,6 +458,8 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
         # Kotak Wajah
         if scan_result.get("wajah_box") is not None:
             wx, wy, ww, wh = map(int, scan_result["wajah_box"])
+            if mirror:  # koordinat scan dari frame asli -> cerminkan ke tampilan
+                wx = W - wx - ww
             conf_pct = scan_result.get("wajah_conf", 0) * 100
             if scan_result.get("wajah_cocok"):
                 col_w = HIJAU
@@ -369,6 +475,8 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
         # Kotak Plat Nomor
         if scan_result.get("plat_box") is not None and scan_result.get("plat_text"):
             px, py, pw, ph = map(int, scan_result["plat_box"])
+            if mirror:
+                px = W - px - pw
             col_p = HIJAU if scan_result.get("plat_valid") else ORANYE
             lbl_p = f"PLAT: {scan_result['plat_text']} ({scan_result.get('plat_conf', 0):.2f})"
             cv2.rectangle(frame, (px, py), (px + pw, py + ph), col_p, 2)
@@ -381,8 +489,11 @@ def gambar_interface(frame, state_sistem: str, target_gate: str, gate_info: dict
         w_status = scan_result.get("wajah_cocok") if scan_result else False
         p_status = scan_result.get("plat_valid") if scan_result else False
 
-        txt_w = f"✓ Wajah: Member #{scan_result.get('wajah_id')}" if (scan_result and w_status) else ("⏳ Wajah Tidak Cocok" if (scan_result and scan_result.get("wajah_ada")) else "⏳ Mencari Wajah...")
-        txt_p = f"✓ Plat: {scan_result.get('plat_text')}" if (scan_result and p_status) else "⏳ Membaca Plat..."
+        txt_w = (f"[OK] Wajah: Member #{scan_result.get('wajah_id')}" if (scan_result and w_status)
+                 else ("[..] Wajah Tidak Cocok" if (scan_result and scan_result.get("wajah_ada"))
+                       else "[..] Mencari Wajah..."))
+        txt_p = (f"[OK] Plat: {scan_result.get('plat_text')}" if (scan_result and p_status)
+                 else "[..] Membaca Plat...")
 
         cv2.putText(frame, txt_w, (16, pos_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, HIJAU if w_status else ORANYE, 2)
         cv2.putText(frame, txt_p, (16, pos_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, HIJAU if p_status else ORANYE, 2)
@@ -422,7 +533,10 @@ def main():
     parser.add_argument("--gate", type=str, default="gate_masuk", choices=["gate_masuk", "gate_keluar"], help="Pintu awal (default: gate_masuk)")
     parser.add_argument("--window", action="store_true", default=False, help="Buka jendela popup OpenCV GUI (default: False/tanpa popup window)")
     parser.add_argument("--no-window", action="store_true", default=False, help="Mode tanpa popup window (default: aktif)")
+    parser.add_argument("--no-mirror", action="store_true", default=False,
+                        help="Matikan tampilan cermin (default: tampilan dicerminkan seperti selfie)")
     args = parser.parse_args()
+    mirror = not args.no_mirror
 
     buka_gui = args.window and not args.no_window
 
@@ -469,9 +583,12 @@ def main():
             print("[ERROR] Kamera tidak dapat dibuka. Gunakan --cam 1 atau --ip <url>.")
             return
 
-    # Inisialisasi Background Scan Worker
+    # Thread-thread latar belakang
+    grabber = FrameGrabber(cap, args.ip)
+    poller = GatePoller(api, interval=0.4)   # polling trigger dari ESP32 tiap 0.4 detik
     worker = ScanWorker()
     StreamServer.start(args.stream_port)
+    last_frame_seq = -1
 
     # State Machine: "SIAGA", "MEMPROSES", "HASIL"
     state_sistem = "SIAGA"
@@ -487,13 +604,13 @@ def main():
     # Buffer stabilisasi
     history_plat = deque(maxlen=6)
     history_wajah = deque(maxlen=6)
+    scan_seq_terakhir_dihitung = -1   # supaya satu hasil scan hanya masuk history SEKALI
 
-    last_poll_gate = 0.0
-    POLL_INTERVAL = 0.4  # Polling trigger dari ESP32 setiap 0.4 detik
     gate_state_info = {"izin": "SIAGA", "trigger": False, "gate": target_gate}
 
     last_scan_send = 0.0
-    SCAN_INTERVAL = 0.8  # Interval pengiriman frame ke worker
+    SCAN_INTERVAL = 0.8        # Interval kirim frame ke worker saat MEMPROSES
+    SCAN_INTERVAL_SIAGA = 2.0  # Saat SIAGA cukup jarang, supaya CPU lega
 
     verif_terakhir = None
     scan_terakhir = None
@@ -501,6 +618,15 @@ def main():
     # Variabel pelacak waktu untuk perhitungan FPS real-time
     waktu_frame_sebelumnya = time.time()
     fps_terhitung = 0.0
+
+    def mulai_proses(waktu):
+        """Masuk ke state MEMPROSES dan bersihkan buffer."""
+        nonlocal state_sistem, waktu_mulai_proses, verif_terakhir
+        state_sistem = "MEMPROSES"
+        waktu_mulai_proses = waktu
+        history_plat.clear()
+        history_wajah.clear()
+        verif_terakhir = None
 
     print("\n[BERJALAN] Sistem otomatis memantau sensor Pintu Masuk & Pintu Keluar.")
     if buka_gui:
@@ -510,66 +636,53 @@ def main():
 
     try:
         while True:
-            # Hitung FPS real-time berdasarkan jeda waktu antar frame
+            # ── A. Ambil Frame Terbaru dari Thread Kamera ────────────────────
+            frame, last_frame_seq = grabber.latest(last_frame_seq)
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            # Hitung FPS real-time (rata-rata bergerak, supaya tidak meloncat-loncat)
             sekarang = time.time()
             delta_waktu = sekarang - waktu_frame_sebelumnya
             if delta_waktu > 0:
-                fps_terhitung = 1.0 / delta_waktu
+                inst = 1.0 / delta_waktu
+                fps_terhitung = inst if fps_terhitung == 0 else (0.9 * fps_terhitung + 0.1 * inst)
             waktu_frame_sebelumnya = sekarang
 
-            # ── A. Ambil Frame Kamera ────────────────────────────────────────
-            if args.ip:
-                frame = baca_ipcam(args.ip)
-                if frame is None:
-                    time.sleep(0.05)
-                    continue
-            else:
-                try:
-                    ok, frame = cap.read()
-                except cv2.error:
-                    continue
-                if not ok or frame is None or frame.size == 0:
-                    continue
+            # ── B. Status Gate ESP32 dari Laravel (dibaca dari thread poller) ─
+            data_gate = poller.latest()
+            if data_gate is not None:
+                g_name = data_gate.get("gate", target_gate)
+                g_izin = data_gate.get("izin", "SIAGA")
+                g_trigger = data_gate.get("trigger", False)
 
-            # ── B. Polling Status Gate ESP32 dari Laravel ────────────────────
-            if sekarang - last_poll_gate >= POLL_INTERVAL:
-                last_poll_gate = sekarang
-                res_status = api.cek_status_gate()
-                if not res_status.get("error"):
-                    data_gate = res_status.get("data", {})
-                    g_name = data_gate.get("gate", target_gate)
-                    g_izin = data_gate.get("izin", "SIAGA")
-                    g_trigger = data_gate.get("trigger", False)
+                gate_state_info = {
+                    "gate": g_name,
+                    "izin": g_izin,
+                    "trigger": g_trigger,
+                    "status": data_gate.get("status", "SIAGA"),
+                }
 
-                    gate_state_info = {
-                        "gate": g_name,
-                        "izin": g_izin,
-                        "trigger": g_trigger,
-                        "status": data_gate.get("status", "SIAGA"),
-                    }
+                # Jika ESP32 / tombol web mendeteksi kendaraan
+                if state_sistem == "SIAGA" and (g_trigger or g_izin == "MENUNGGU"):
+                    target_gate = g_name
+                    nama_pintu = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
+                    print(f"\n[TRIGGER DITERIMA] Sensor {nama_pintu} ({target_gate}) mendeteksi kendaraan!")
+                    mulai_proses(sekarang)
 
-                    # Jika ESP32 / tombol web mendeteksi kendaraan
-                    if state_sistem == "SIAGA" and (g_trigger or g_izin == "MENUNGGU"):
-                        target_gate = g_name
-                        nama_pintu = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
-                        print(f"\n[TRIGGER DITERIMA] Sensor {nama_pintu} ({target_gate}) mendeteksi kendaraan!")
-                        state_sistem = "MEMPROSES"
-                        waktu_mulai_proses = sekarang
+                # Jika gerbang sudah direset kembali ke SIAGA oleh ESP32
+                elif state_sistem == "HASIL" and g_izin == "SIAGA":
+                    if sekarang - waktu_mulai_hasil >= 2.0:
+                        state_sistem = "SIAGA"
+                        verif_terakhir = None
                         history_plat.clear()
                         history_wajah.clear()
-                        verif_terakhir = None
-
-                    # Jika gerbang sudah direset kembali ke SIAGA oleh ESP32
-                    elif state_sistem == "HASIL" and g_izin == "SIAGA":
-                        if sekarang - waktu_mulai_hasil >= 2.0:
-                            state_sistem = "SIAGA"
-                            verif_terakhir = None
-                            history_plat.clear()
-                            history_wajah.clear()
-                            print(f"[SIAGA] {target_gate} kembali siaga untuk kendaraan berikutnya.\n")
+                        print(f"[SIAGA] {target_gate} kembali siaga untuk kendaraan berikutnya.\n")
 
             # ── C. Pemindaian Wajah & Plat Secara Berkala ─────────────────────
-            if sekarang - last_scan_send >= SCAN_INTERVAL and not worker.is_busy():
+            interval_scan = SCAN_INTERVAL if state_sistem == "MEMPROSES" else SCAN_INTERVAL_SIAGA
+            if sekarang - last_scan_send >= interval_scan and not worker.is_busy():
                 worker.kirim_frame(frame)
                 last_scan_send = sekarang
 
@@ -583,11 +696,7 @@ def main():
                     if scan_terakhir.get("plat_valid") or scan_terakhir.get("wajah_cocok"):
                         nama_pintu = "PINTU KELUAR" if "keluar" in target_gate else "PINTU MASUK"
                         print(f"\n[DETEKSI KAMERA] {nama_pintu}: Objek terdeteksi di kamera! Memulai pencocokan...")
-                        state_sistem = "MEMPROSES"
-                        waktu_mulai_proses = sekarang
-                        history_plat.clear()
-                        history_wajah.clear()
-                        verif_terakhir = None
+                        mulai_proses(sekarang)
 
             # ── D. Logika Siklus State Machine ───────────────────────────────
             sisa_waktu = 0.0
@@ -596,7 +705,15 @@ def main():
                 durasi_berjalan = sekarang - waktu_mulai_proses
                 sisa_waktu = max(0.0, DURASI_MAKS_PROSES - durasi_berjalan)
 
-                if scan_terakhir:
+                # Masukkan hasil scan ke history HANYA bila:
+                #   (1) belum pernah dihitung (seq baru), dan
+                #   (2) scan itu dimulai setelah proses dimulai (bukan sisa scan lama saat SIAGA).
+                # Tanpa ini, loop yang cepat akan memasukkan satu hasil scan berkali-kali
+                # dan voting 2x / 60% jadi tidak berarti.
+                if (scan_terakhir
+                        and scan_terakhir.get("seq") != scan_seq_terakhir_dihitung
+                        and scan_terakhir.get("t_mulai", 0) >= waktu_mulai_proses):
+                    scan_seq_terakhir_dihitung = scan_terakhir["seq"]
                     if scan_terakhir.get("plat_valid"):
                         history_plat.append(scan_terakhir["plat_text"])
                     if scan_terakhir.get("wajah_ada"):
@@ -644,7 +761,7 @@ def main():
                     )
                     verif_terakhir = resp_verif
                     state_sistem = "HASIL"
-                    waktu_mulai_hasil = sekarang
+                    waktu_mulai_hasil = time.time()
 
                     st_hasil = resp_verif.get("status", "tolak")
                     ket_hasil = resp_verif.get("keterangan", "")
@@ -662,8 +779,11 @@ def main():
                     print("[SIAGA] Sistem siap memantau kendaraan berikutnya.\n")
 
             # ── E. Render UI Tampilan Kamera (selalu dijalankan tiap frame) ───
+            # Tampilan dicerminkan SETELAH scan; YOLO & OCR tetap membaca frame asli (tidak terbalik).
+            tampil = cv2.flip(frame, 1) if mirror else frame
+
             gambar_interface(
-                frame=frame,
+                frame=tampil,
                 state_sistem=state_sistem,
                 target_gate=target_gate,
                 gate_info=gate_state_info,
@@ -672,17 +792,17 @@ def main():
                 sisa_waktu=sisa_waktu,
                 interval_detik=SCAN_INTERVAL,
                 fps_saat_ini=fps_terhitung,
+                mirror=mirror,
             )
 
             # Kirim frame dengan overlay deteksi ke stream web
-            StreamServer.update(frame)
+            StreamServer.update(tampil)
 
             # Jika mode headless (default), lewati cv2.imshow agar tidak memunculkan window popup
             if not buka_gui:
-                time.sleep(0.01)
                 continue
 
-            cv2.imshow("ParkVisi - Sistem Akses Parkir Terpadu", frame)
+            cv2.imshow("ParkVisi - Sistem Akses Parkir Terpadu", tampil)
             # ── F. Kontrol Keyboard (Hanya jika GUI aktif) ───────────────────
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -692,21 +812,13 @@ def main():
                 target_gate = "gate_masuk"
                 print("\n[MANUAL] Trigger PINTU MASUK (gate_masuk)...")
                 api.trigger_manual("gate_masuk")
-                state_sistem = "MEMPROSES"
-                waktu_mulai_proses = sekarang
-                history_plat.clear()
-                history_wajah.clear()
-                verif_terakhir = None
+                mulai_proses(sekarang)
             elif key in (ord("2"), ord("k"), ord("K")):
                 # Trigger Manual Pintu Keluar
                 target_gate = "gate_keluar"
                 print("\n[MANUAL] Trigger PINTU KELUAR (gate_keluar)...")
                 api.trigger_manual("gate_keluar")
-                state_sistem = "MEMPROSES"
-                waktu_mulai_proses = sekarang
-                history_plat.clear()
-                history_wajah.clear()
-                verif_terakhir = None
+                mulai_proses(sekarang)
             elif key in (ord("r"), ord("R")):
                 # Reset Manual Gerbang
                 print(f"[MANUAL] Mereset gerbang ({target_gate}) ke SIAGA...")

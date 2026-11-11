@@ -15,7 +15,7 @@ def create_app():
         raise
 
     from app.api.routes import bp
-    app.register_blueprint(bp, url_prefix="/api")
+    app.register_blueprint(bp)
 
     @app.errorhandler(Exception)
     def on_error(e):
