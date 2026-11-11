@@ -15,10 +15,10 @@ YOLO_ACCEPT_CONF = 0.90    # ambang diterima sebagai member. Ganti dengan hasil 
 # Nama kelas di model YOLO -> member_id di database Laravel.
 # Kunci HARUS persis sama dengan nama kelas di model (cek: YOLO('models/best.pt').names)
 MEMBER_MAP = {
-    "Achmad-Ramadhani": 1,          # <-- GANTI angka dengan member_id asli di database
-    "Dimas-Dwi-Nugroho": 2,
-    "Dimas-Febrian-Firjatullah": 3,
-    "Firdo-Al-Farobbi": 4,
+    "Achmad-Ramadhani": 2,          # <-- GANTI angka dengan member_id asli di database
+    "Dimas-Dwi-Nugroho": 3,
+    "Dimas-Febrian-Firjatullah": 4,
+    "Firdo-Al-Farobbi": 1,
     "Rintan-Nur-Wardani": 5,
 }
 

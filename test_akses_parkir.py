@@ -17,6 +17,13 @@ Kontrol:
   - Hasil pemindaian langsung tampil di Web Admin: http://localhost:8000/parkir/kamera
   - Jika ingin menampilkan popup window OpenCV, gunakan opsi: --window
 
+Arah gambar kamera:
+  - Default: gambar ditampilkan APA ADANYA dari kamera (tidak dicerminkan).
+  - --flip-source : balik gambar sumber. Pakai bila kamera menghasilkan gambar tercermin
+                    (tulisan/plat terbalik). Pembalikan dilakukan SEBELUM scan, jadi OCR plat
+                    juga membaca gambar yang benar.
+  - --mirror      : cerminkan hanya tampilan (seperti selfie). Scan tetap memakai gambar asli.
+
 Perubahan performa (anti-lag):
   - Baca kamera dijalankan di thread sendiri (FrameGrabber), loop utama selalu dapat frame terbaru.
   - Polling status gerbang ke Laravel dijalankan di thread sendiri (GatePoller),
@@ -533,10 +540,14 @@ def main():
     parser.add_argument("--gate", type=str, default="gate_masuk", choices=["gate_masuk", "gate_keluar"], help="Pintu awal (default: gate_masuk)")
     parser.add_argument("--window", action="store_true", default=False, help="Buka jendela popup OpenCV GUI (default: False/tanpa popup window)")
     parser.add_argument("--no-window", action="store_true", default=False, help="Mode tanpa popup window (default: aktif)")
-    parser.add_argument("--no-mirror", action="store_true", default=False,
-                        help="Matikan tampilan cermin (default: tampilan dicerminkan seperti selfie)")
+    parser.add_argument("--mirror", action="store_true", default=False,
+                        help="Cerminkan tampilan seperti selfie (default: mati, tampilan apa adanya dari kamera)")
+    parser.add_argument("--flip-source", action="store_true", default=False,
+                        help="Balik gambar sumber kamera. Pakai bila kamera menghasilkan gambar tercermin "
+                             "(tulisan/plat terbalik). Scan & OCR ikut membaca gambar yang sudah dibalik.")
     args = parser.parse_args()
-    mirror = not args.no_mirror
+    mirror = args.mirror
+    flip_source = args.flip_source
 
     buka_gui = args.window and not args.no_window
 
@@ -549,6 +560,7 @@ def main():
         print("[MODE] Web Streaming aktif (Tanpa popup window).")
         print("       Buka Web Admin di : http://localhost:8000/parkir/kamera")
         print(f"       Siaran MJPEG di   : http://127.0.0.1:{args.stream_port}/stream")
+    print(f"[KAMERA] flip-source={'ON' if flip_source else 'off'} | mirror-tampilan={'ON' if mirror else 'off'}")
 
     # 1. Inisialisasi Model YOLO
     print("[1/3] Memuat Model YOLO...")
@@ -559,7 +571,7 @@ def main():
         print("[INFO] Model YOLO siap digunakan.")
     except Exception as e:
         print(f"[ERROR] Model YOLO gagal dimuat: {e}")
-        print("        Cek YOLO_MODEL_PATH di config.py dan pastikan models/best.pt ada.")
+        print("        Cek YOLO_MODEL_PATH di config.py dan pastikan model best.pt ada.")
         return
 
     # 2. Hubungkan ke API Laravel
@@ -641,6 +653,11 @@ def main():
             if frame is None:
                 time.sleep(0.005)
                 continue
+
+            # Balik gambar sumber SEBELUM scan & overlay, supaya plat terbaca OCR
+            # dan semua teks overlay tampil normal.
+            if flip_source:
+                frame = cv2.flip(frame, 1)
 
             # Hitung FPS real-time (rata-rata bergerak, supaya tidak meloncat-loncat)
             sekarang = time.time()
@@ -779,7 +796,7 @@ def main():
                     print("[SIAGA] Sistem siap memantau kendaraan berikutnya.\n")
 
             # ── E. Render UI Tampilan Kamera (selalu dijalankan tiap frame) ───
-            # Tampilan dicerminkan SETELAH scan; YOLO & OCR tetap membaca frame asli (tidak terbalik).
+            # Opsi --mirror hanya mencerminkan TAMPILAN setelah scan (default: mati).
             tampil = cv2.flip(frame, 1) if mirror else frame
 
             gambar_interface(

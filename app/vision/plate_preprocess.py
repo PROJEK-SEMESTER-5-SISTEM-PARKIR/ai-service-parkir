@@ -180,7 +180,7 @@ def prepare_variants(plate_bgr, debug=None, fast=False):
 
     # Mode cepat: ambil 3 varian terpilih saja
     if fast:
-        PRIORITAS = ("bersih_150", "bersih", "sharp", "abu", "clahe", "otsu")
+        PRIORITAS = ("abu", "sharp", "bersih_150", "bersih", "clahe", "otsu")
         pilihan = [v for nama in PRIORITAS for v in varian if v[0] == nama]
         return pilihan[:3] if pilihan else varian[:3]
     return varian

@@ -5,9 +5,13 @@ Uji tanpa server (foto di data/plates, gambar tiap langkah disimpan di data/debu
 """
 import cv2
 
-from app.config import DEBUG_DIR, PLATE_EARLY_STOP, PLATE_TEST_DIR
+from app.config import DEBUG_DIR, PLATE_EARLY_STOP, PLATE_LENGTH, PLATE_TEST_DIR
 from app.intelligence import plate_rules
 from app.vision import plate_detector, plate_ocr, plate_preprocess
+
+# Plat nomor Indonesia minimal 5 karakter. Baris masa berlaku (mis. "10 28") hanya 4 karakter
+# dan kadang terbaca seolah plat valid (mis. "I02B"), jadi bacaan sependek itu dibuang.
+MIN_KARAKTER_PLAT = max(5, PLATE_LENGTH[0])
 
 
 def _gagal(pesan):
@@ -21,7 +25,13 @@ def read_plate(img, debug=None, fast=False):
     fast=True: mode real-time (resize ke 640px, OCR 1 PSM x 3 varian).
                Lebih cepat ~8-10x, cukup untuk sistem parkir live.
     fast=False: mode akurasi tinggi (4 PSM x 8+ varian) untuk foto statis.
+
+    Pada mode cepat, pencarian lokasi plat memakai citra yang diperkecil, tetapi crop yang
+    dikirim ke OCR diambil ulang dari citra asli (resolusi penuh) agar goresan tipis
+    (mis. diagonal huruf N) tidak hilang.
     """
+    img_asli = img   # simpan citra resolusi penuh untuk crop OCR
+
     # Mode cepat: perkecil frame agar detektor tidak bekerja pada resolusi penuh
     scale = 1.0
     if fast:
@@ -30,7 +40,7 @@ def read_plate(img, debug=None, fast=False):
             scale = 640.0 / w
             img = cv2.resize(img, (640, int(h * scale)))
 
-    lokasi = plate_detector.find_plate_candidates(img, debug)
+    lokasi = plate_detector.find_plate_candidates(img, debug, img_hires=img_asli)
     if not lokasi:
         return _gagal("Lokasi plat tidak ditemukan.")
 
@@ -47,7 +57,7 @@ def read_plate(img, debug=None, fast=False):
             r["box"] = [bx, by, bw, bh]
             hasil_k.append(r)
 
-        evaluasi_k = plate_rules.evaluasi(hasil_k)
+        evaluasi_k = [e for e in plate_rules.evaluasi(hasil_k) if len(e["text"]) >= MIN_KARAKTER_PLAT]
         semua.extend(evaluasi_k)
         if evaluasi_k and evaluasi_k[0]["valid"] and evaluasi_k[0]["confidence"] >= PLATE_EARLY_STOP:
             break

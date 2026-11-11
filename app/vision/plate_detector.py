@@ -5,6 +5,12 @@ Dua sumber kandidat:
   2) Blob : adaptive threshold -> komponen terhubung -> deretan blob karakter sejajar
 Semua kandidat diluruskan (perspektif) lalu dinilai dari ISINYA (jumlah karakter di dalam crop),
 bukan hanya bentuknya, sehingga kaca depan / gril tidak mengalahkan plat.
+
+Resolusi tinggi:
+  Pemilihan kandidat dilakukan pada citra yang sudah diperkecil (cepat). Setelah kandidat
+  terpilih, crop yang dikirim ke OCR diambil ULANG dari citra asli (img_hires) supaya goresan
+  tipis seperti diagonal huruf N tidak hilang. Bila img_hires tidak diberikan, perilaku sama
+  seperti sebelumnya (crop dari citra yang dipakai mendeteksi).
 """
 import cv2
 import numpy as np
@@ -16,7 +22,8 @@ from app.config import (
 )
 from app.vision import plate_segment
 
-ASPECT_IDEAL = 3.0          # rasio lebar:tinggi plat untuk pembobotan
+ASPECT_IDEAL = 3.0          # rasio lebar:tinggi PLAT UTUH (dua baris) untuk pembobotan
+ASPECT_IDEAL_BARIS = 5.0    # rasio untuk blob SATU baris karakter (tanpa baris masa berlaku)
 TOP_TEPI = 20               # kandidat tepi terbaik yang dinilai isinya
 TOP_BLOB = 15               # kandidat blob terbaik yang dinilai isinya
 IOU_NMS = 0.4
@@ -53,8 +60,8 @@ def _iou(a, b):
     return irisan / float(aw * ah + bw * bh - irisan)
 
 
-def _bobot_aspek(aspect):
-    return max(0.3, 1.0 - abs(aspect - ASPECT_IDEAL) / 3.0)
+def _bobot_aspek(aspect, ideal=ASPECT_IDEAL):
+    return max(0.3, 1.0 - abs(aspect - ideal) / 3.0)
 
 
 def _urut_titik(pts):
@@ -212,8 +219,9 @@ def _dari_tepi(img, gray_c, H, W):
         x1, y1 = int(min(W, pts[:, 0].max())), int(min(H, pts[:, 1].max()))
         if x1 - x0 < 4 or y1 - y0 < 4:
             continue
+        # "rect" disimpan supaya crop bisa dibuat ulang dari citra resolusi tinggi
         hasil.append({"box": (x0, y0, x1 - x0, y1 - y0), "crop": crop, "aspect": c["aspect"],
-                      "bobot": _bobot_aspek(c["aspect"]),
+                      "bobot": _bobot_aspek(c["aspect"]), "rect": c["rect"],
                       "kualitas": 0.6 + 0.4 * c["rect_ratio"], "sumber": "tepi"})
     return edges, closed_pertama, blur, hasil
 
@@ -268,16 +276,47 @@ def _dari_karakter(img, gray_c, H, W):
         posisi_ok = 1.0 if Y_CENTER_MIN_RATIO <= cy_rel <= Y_CENTER_MAX_RATIO else 0.5
         seragam = max(0.0, 1.0 - 2.0 * float(tinggi.std() / tinggi.mean()))
         hasil.append({"box": (x0, y0, bw, bh), "crop": img[y0:y1, x0:x1].copy(), "aspect": aspect,
-                      "bobot": _bobot_aspek(aspect) * posisi_ok * area_penalty,
+                      "bobot": _bobot_aspek(aspect, ASPECT_IDEAL_BARIS) * posisi_ok * area_penalty,
                       "kualitas": 0.6 + 0.4 * seragam, "sumber": "blob"})
     return hasil
 
 
 # ---------------------------------------------------------------------------
-def find_plate_candidates(img, debug=None):
+# Crop ulang dari citra resolusi tinggi (hanya untuk kandidat yang sudah terpilih)
+# ---------------------------------------------------------------------------
+def _crop_resolusi_tinggi(asli, k, rasio):
+    """Ambil ulang crop plat dari citra asli.
+
+    asli  : citra resolusi tinggi (BGR)
+    k     : kandidat terpilih (punya 'sumber', 'box', dan untuk sumber 'tepi' juga 'rect')
+    rasio : lebar citra asli / lebar citra deteksi
+    Return crop BGR (baris masa berlaku sudah dibuang) atau None bila gagal.
+    """
+    try:
+        if k["sumber"] == "tepi" and "rect" in k:
+            (cx, cy), (rw, rh), ang = k["rect"]
+            crop = _luruskan(asli, ((cx * rasio, cy * rasio), (rw * rasio, rh * rasio), ang))
+        else:
+            x, y, w, h = k["box"]
+            H0, W0 = asli.shape[:2]
+            crop = asli[int(y * rasio):min(H0, int((y + h) * rasio)),
+                        int(x * rasio):min(W0, int((x + w) * rasio))].copy()
+        if crop is None or crop.size == 0:
+            return None
+        return _buang_baris_masa_berlaku(crop)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+def find_plate_candidates(img, debug=None, img_hires=None):
     """Return daftar kandidat (terbaik dulu): dict(box, score, aspect, crop, nchar, sumber).
-    `debug` (dict) diisi gambar tiap langkah bila diberikan."""
+    `debug` (dict) diisi gambar tiap langkah bila diberikan.
+    `img_hires` (opsional): citra asli beresolusi lebih tinggi dari `img`; dipakai untuk
+    membuat ulang crop kandidat terpilih supaya OCR membaca gambar yang lebih tajam."""
+    asli = img_hires if img_hires is not None else img
     img = _limit_width(img)
+    rasio = asli.shape[1] / float(img.shape[1])   # >1 bila citra asli lebih besar dari citra deteksi
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape
     gray_c = _clahe.apply(gray)          # bantu foto gelap
@@ -291,7 +330,7 @@ def find_plate_candidates(img, debug=None):
         k["crop"] = _buang_baris_masa_berlaku(k["crop"])
         nchar = _jumlah_karakter(cv2.cvtColor(k["crop"], cv2.COLOR_BGR2GRAY))
         k["nchar"] = nchar
-        faktor = 1.0 + min(nchar, 8) / 4 if 4 <= nchar <= 10 else 0.3
+        faktor = 1.0 + min(nchar, 8) / 4 if 5 <= nchar <= 10 else 0.3
         k["score"] = faktor * k["bobot"] * k["kualitas"]
 
     kandidat.sort(key=lambda k: k["score"], reverse=True)
@@ -302,6 +341,14 @@ def find_plate_candidates(img, debug=None):
         terpilih.append(k)
         if len(terpilih) >= PLATE_MAX_CANDIDATES:
             break
+
+    # Ganti crop kandidat terpilih dengan versi resolusi tinggi.
+    # (Pemilihan & penilaian di atas tetap memakai citra kecil, jadi kecepatan tidak berubah.)
+    if rasio > 1.01:
+        for k in terpilih:
+            hi = _crop_resolusi_tinggi(asli, k, rasio)
+            if hi is not None:
+                k["crop"] = hi
 
     if debug is not None:
         overlay = img.copy()

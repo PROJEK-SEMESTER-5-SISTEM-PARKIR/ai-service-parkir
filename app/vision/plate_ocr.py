@@ -110,7 +110,7 @@ def _baca_tesseract(img, psm=7):
     """
     _atur_tesseract()
     # OEM 3 = LSTM + Legacy (akurasi terbaik), PSM dari parameter
-    dasar = f"--oem 3 --psm {psm}"
+    dasar = f"--oem 3 --psm {psm} -c load_system_dawg=0 -c load_freq_dawg=0"
     cfg_whitelist = f"{dasar} -c tessedit_char_whitelist={PLATE_ALLOWLIST}"
 
     dengan = _data_tesseract(img, cfg_whitelist)
